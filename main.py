@@ -55,7 +55,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 ALLOWED_CHAT_IDS: set[int] = set()  # пусто = открыт для всех; добавь: {123456789}
 
 NOTEBOOK_ID = "88a124fc-a20d-4836-99a3-25b079468568"
-MCP_PYTHON = r"C:\Users\Admin\AppData\Roaming\uv\tools\notebooklm-mcp-2026\Scripts\python.exe"
+# На Windows используем uv-окружение, на Linux (Railway) — системный Python
+_WIN_MCP_PYTHON = r"C:\Users\Admin\AppData\Roaming\uv\tools\notebooklm-mcp-2026\Scripts\python.exe"
+MCP_PYTHON = _WIN_MCP_PYTHON if os.path.exists(_WIN_MCP_PYTHON) else sys.executable
 
 # История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
 _history: dict[int, list[dict]] = defaultdict(list)
