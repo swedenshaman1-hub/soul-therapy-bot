@@ -36,14 +36,37 @@ load_dotenv()
 _nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
 _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 if _nb_auth_json and _nb_data_dir:
+    import httpx as _httpx
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
     _auth_data = json.loads(_nb_auth_json)
-    # Очищаем CSRF чтобы клиент получил свежий токен с NotebookLM при старте.
-    # GenerateFreeFormStreamed строго проверяет CSRF, а batchexecute — нет,
-    # поэтому устаревший токен приводит к 401 только на запросах.
-    _auth_data["csrf_token"] = ""
-    _auth_data["session_id"] = ""
+    # Пробуем получить свежий CSRF с NotebookLM до запуска клиента.
+    # GenerateFreeFormStreamed строго валидирует CSRF, а batchexecute — нет.
+    try:
+        _jar = _httpx.Cookies()
+        for _k, _v in _auth_data.get("cookies", {}).items():
+            _jar.set(_k, _v, domain=".google.com")
+        _hdrs = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        with _httpx.Client(cookies=_jar, headers=_hdrs, follow_redirects=True, timeout=20.0) as _hc:
+            _pg = _hc.get("https://notebooklm.google.com/")
+        if _pg.status_code == 200 and "accounts.google.com" not in str(_pg.url):
+            _m = re.search(r'"SNlM0e":"([^"]+)"', _pg.text)
+            if _m:
+                _auth_data["csrf_token"] = _m.group(1)
+                _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
+                if _m2:
+                    _auth_data["session_id"] = _m2.group(1)
+                print(f"Startup CSRF OK: {_auth_data['csrf_token'][:35]}...", flush=True)
+            else:
+                print("Startup CSRF: SNlM0e not in page, using stored token", flush=True)
+        else:
+            print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
+    except Exception as _e:
+        print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
     with open(_auth_path, "w", encoding="utf-8") as _f:
         json.dump(_auth_data, _f)
 
@@ -197,27 +220,43 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
             logger.exception(f"NotebookLM proxy exception: {e}")
             return None
 
-    # Fallback: прямой импорт (работает только с российского IP)
+    # Fallback: прямой импорт
     conv_id = _nb_conversations.get(chat_id)
-    try:
-        from notebooklm_mcp_2026.tools.query import query_notebook
-        result = query_notebook(
-            notebook_id=NOTEBOOK_ID,
-            query=query,
-            conversation_id=conv_id or None,
-        )
-        logger.info(f"NotebookLM result status: {result.get('status')} | keys: {list(result.keys())}")
-        if result.get("status") == "success":
-            new_conv = result.get("conversation_id")
-            if new_conv:
-                _nb_conversations[chat_id] = new_conv
-            return result.get("answer", "").strip() or None
-        else:
-            logger.error(f"NotebookLM error: {result.get('error')} | hint: {result.get('hint','')}")
+    from notebooklm_mcp_2026.tools.query import query_notebook
+    from notebooklm_mcp_2026 import server as _nb_server
+
+    for _attempt in range(2):
+        try:
+            result = query_notebook(
+                notebook_id=NOTEBOOK_ID,
+                query=query,
+                conversation_id=conv_id or None,
+            )
+            logger.info(f"NotebookLM result status: {result.get('status')} | attempt={_attempt}")
+            if result.get("status") == "success":
+                new_conv = result.get("conversation_id")
+                if new_conv:
+                    _nb_conversations[chat_id] = new_conv
+                return result.get("answer", "").strip() or None
+
+            error = result.get("error", "")
+            # При 401 обновляем CSRF и повторяем
+            if "401" in str(error) and _attempt == 0:
+                logger.info("NotebookLM 401, refreshing CSRF and retrying...")
+                try:
+                    _client = _nb_server.get_client()
+                    _client._refresh_auth_tokens()
+                except Exception as _re:
+                    logger.warning(f"CSRF refresh failed: {_re}")
+                    _nb_server.reset_client()
+                continue
+
+            logger.error(f"NotebookLM error: {error} | hint: {result.get('hint','')}")
             return None
-    except Exception as e:
-        logger.exception(f"NotebookLM exception: {e}")
-        return None
+        except Exception as e:
+            logger.exception(f"NotebookLM exception: {e}")
+            return None
+    return None
 
 
 # ─── Транскрипция голоса ──────────────────────────────────────────────────────
