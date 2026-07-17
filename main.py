@@ -37,9 +37,14 @@ _nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
 if _nb_auth_json and _nb_data_dir:
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
-    if not os.path.exists(_auth_path):
-        with open(_auth_path, "w", encoding="utf-8") as _f:
-            _f.write(_nb_auth_json)
+    _auth_data = json.loads(_nb_auth_json)
+    # Очищаем CSRF чтобы клиент получил свежий токен с NotebookLM при старте.
+    # GenerateFreeFormStreamed строго проверяет CSRF, а batchexecute — нет,
+    # поэтому устаревший токен приводит к 401 только на запросах.
+    _auth_data["csrf_token"] = ""
+    _auth_data["session_id"] = ""
+    with open(_auth_path, "w", encoding="utf-8") as _f:
+        json.dump(_auth_data, _f)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -469,6 +474,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
