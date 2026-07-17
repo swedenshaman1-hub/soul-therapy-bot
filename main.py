@@ -163,8 +163,11 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
             env=env,
         )
         if result.returncode != 0:
-            logger.error(f"NotebookLM error: {result.stderr[:500]}")
+            logger.error(f"NotebookLM subprocess failed (rc={result.returncode})")
+            logger.error(f"STDERR: {result.stderr[:1000]}")
+            logger.error(f"STDOUT: {result.stdout[:500]}")
             return None
+        logger.info(f"NotebookLM stdout: {result.stdout[:200]}")
         data = json.loads(result.stdout.strip())
         if data.get("status") == "success":
             new_conv = data.get("conversation_id")
@@ -172,7 +175,7 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
                 _nb_conversations[chat_id] = new_conv
             return data.get("answer", "").strip() or None
         else:
-            logger.error(f"NotebookLM returned error: {data.get('error')}")
+            logger.error(f"NotebookLM returned error: {data.get('error')} | hint: {data.get('hint','')}")
             return None
     except subprocess.TimeoutExpired:
         logger.error("NotebookLM timeout")
