@@ -136,52 +136,28 @@ _nb_conversations: dict[int, str] = {}
 
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    """Запрашивает NotebookLM через notebooklm-mcp-2026."""
+    """Запрашивает NotebookLM через notebooklm-mcp-2026 (прямой импорт)."""
     conv_id = _nb_conversations.get(chat_id)
-
-    script = (
-        "import sys, json\n"
-        "sys.stdout.reconfigure(encoding='utf-8')\n"
-        "from notebooklm_mcp_2026.tools.query import query_notebook\n"
-        f"r = query_notebook({NOTEBOOK_ID!r}, {query!r}"
-        + (f", conversation_id={conv_id!r}" if conv_id else "")
-        + ")\n"
-        "print(json.dumps(r, ensure_ascii=False))\n"
-    )
-
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUTF8"] = "1"
-
     try:
-        result = subprocess.run(
-            [MCP_PYTHON, "-c", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=120,
-            env=env,
+        from notebooklm_mcp_2026.tools.query import query_notebook
+        logger.info(f"NotebookLM query: {query[:80]}")
+        result = query_notebook(
+            notebook_id=NOTEBOOK_ID,
+            query=query,
+            conversation_id=conv_id or None,
         )
-        if result.returncode != 0:
-            logger.error(f"NotebookLM subprocess failed (rc={result.returncode})")
-            logger.error(f"STDERR: {result.stderr[:1000]}")
-            logger.error(f"STDOUT: {result.stdout[:500]}")
-            return None
-        logger.info(f"NotebookLM stdout: {result.stdout[:200]}")
-        data = json.loads(result.stdout.strip())
-        if data.get("status") == "success":
-            new_conv = data.get("conversation_id")
+        logger.info(f"NotebookLM result status: {result.get('status')} | keys: {list(result.keys())}")
+        if result.get("status") == "success":
+            new_conv = result.get("conversation_id")
             if new_conv:
                 _nb_conversations[chat_id] = new_conv
-            return data.get("answer", "").strip() or None
+            return result.get("answer", "").strip() or None
         else:
-            logger.error(f"NotebookLM returned error: {data.get('error')} | hint: {data.get('hint','')}")
+            logger.error(f"NotebookLM error: {result.get('error')} | hint: {result.get('hint','')}")
             return None
-    except subprocess.TimeoutExpired:
-        logger.error("NotebookLM timeout")
     except Exception as e:
-        logger.exception(f"NotebookLM error: {e}")
-    return None
+        logger.exception(f"NotebookLM exception: {e}")
+        return None
 
 
 # ─── Транскрипция голоса ──────────────────────────────────────────────────────
