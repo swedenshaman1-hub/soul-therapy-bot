@@ -117,12 +117,14 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Теребенина.
+COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Валентиновича Теребенина.
 
 Твоя роль: обучать методу Терапии Души на основе авторских материалов Теребенина. Отвечать тепло, живо и поддерживающе — как опытный наставник в живом разговоре, а не как энциклопедия. Использовать термины метода естественно: слайды, родовые программы, Триморф, Собор, кинезиологический тест, 7-шаговый алгоритм, Дух, Душа, Тело. Давать практические примеры и пояснения. При необходимости задавать уточняющие вопросы.
 
+Когда упоминаешь автора метода, используй только «Евгений Валентинович» или «Евгений Валентинович Теребенин». Никогда не пиши «Женя», «Женечка» или другие уменьшительные формы.
+
 Формат ответа — ОБЯЗАТЕЛЬНО:
-Пиши сплошным живым текстом, как говоришь вслух. Никаких звёздочек, никаких дефисов в начале строк, никаких тире как маркеров списка, никаких кавычек-ёлочек, никаких заголовков с решётками, никакого markdown вообще. Только обычные слова и предложения. Абзацы разделяй пустой строкой. Завершай ответ коротким вопросом или приглашением к следующему шагу."""
+Пиши сплошным живым текстом, как говоришь вслух. Никаких звёздочек, никаких дефисов в начале строк, никаких тире как маркеров списка, никаких кавычек-ёлочек, никаких заголовков с решётками, никакого markdown вообще. Только обычные слова и предложения. Абзацы разделяй пустой строкой. Длина ответа — не более 400 слов. Завершай ответ коротким вопросом или приглашением к следующему шагу."""
 
 
 def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
@@ -246,9 +248,11 @@ def _transcribe(file_path: str) -> str:
 
 # ─── TTS через Gemini ─────────────────────────────────────────────────────────
 
-def _text_to_speech(text: str) -> str:
-    # Берём до 2500 символов, обрезаем по границе предложения
-    tts_text = text[:2500].rsplit(".", 1)[0] + "." if len(text) > 2500 else text
+_TTS_CHUNK_LIMIT = 4000  # символов на один TTS-запрос
+
+
+def _tts_chunk(text: str) -> str:
+    """Генерирует один WAV-файл из текста (до _TTS_CHUNK_LIMIT символов)."""
     client = google_genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=300_000),
@@ -257,7 +261,7 @@ def _text_to_speech(text: str) -> str:
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash-preview-tts",
-                contents=tts_text,
+                contents=text,
                 config=genai_types.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=genai_types.SpeechConfig(
@@ -284,6 +288,34 @@ def _text_to_speech(text: str) -> str:
         wf.setframerate(24000)
         wf.writeframes(pcm_data)
     return path
+
+
+def _split_for_tts(text: str) -> list[str]:
+    """Делит текст на части по _TTS_CHUNK_LIMIT символов, разбивая по предложениям."""
+    if len(text) <= _TTS_CHUNK_LIMIT:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > _TTS_CHUNK_LIMIT:
+        cut = remaining[:_TTS_CHUNK_LIMIT]
+        # Режем по последней точке чтобы не обрывать предложение на полуслове
+        last_dot = cut.rfind(".")
+        if last_dot > _TTS_CHUNK_LIMIT // 2:
+            cut = cut[:last_dot + 1]
+        chunks.append(cut.strip())
+        remaining = remaining[len(cut):].strip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _text_to_speech(text: str) -> list[str]:
+    """Возвращает список путей к WAV-файлам (один или несколько если текст длинный)."""
+    parts = _split_for_tts(text)
+    paths: list[str] = []
+    for part in parts:
+        paths.append(_tts_chunk(part))
+    return paths
 
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
@@ -337,19 +369,20 @@ async def _answer(update: Update, question: str):
     await _send_long(update, answer)
 
     # Голосовой ответ
-    audio_path = None
+    audio_paths: list[str] = []
     try:
         await update.message.reply_text("Озвучиваю... 🎙")
-        audio_path = await _run_blocking(_text_to_speech, answer)
-        with open(audio_path, "rb") as f:
-            await update.message.reply_voice(f)
+        audio_paths = await _run_blocking(_text_to_speech, answer)
+        for path in audio_paths:
+            with open(path, "rb") as f:
+                await update.message.reply_voice(f)
     except Exception as e:
         logger.exception("TTS error")
         await update.message.reply_text(f"Голос не удалось сгенерировать: {e}")
     finally:
-        if audio_path:
+        for path in audio_paths:
             try:
-                os.unlink(audio_path)
+                os.unlink(path)
             except Exception:
                 pass
 
