@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,25 @@ def _build_notebooklm_query(question: str, history: list[dict]) -> str:
         f"Вопрос ученика по методу Терапии Души Евгения Теребенина:\n{question}\n\n"
         "Дай развёрнутый ответ, опираясь на материалы метода."
     )
+
+
+def _strip_markdown(text: str) -> str:
+    """Убирает markdown-форматирование и цитатные индексы из текста."""
+    # Сноски вида [1], [1, 2], [1-3]
+    text = re.sub(r'\s*\[\d+(?:[,\-\s]\s*\d+)*\]', '', text)
+    # Заголовки ### ## #
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Жирный и курсив **text**, *text*, __text__, _text_
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'__(.+?)__', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'_(.+?)_', r'\1', text)
+    # Маркеры списков в начале строки: *, -, •, 1.
+    text = re.sub(r'^\s*[\*\-•]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    # Лишние пустые строки
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
 COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Теребенина.
@@ -305,6 +325,7 @@ async def _answer(update: Update, question: str):
     except Exception as e:
         logger.exception("Gemini reformat error")
         answer = raw  # fallback — отдаём сырой ответ
+    answer = _strip_markdown(answer)
 
     # Сохраняем в историю
     history.append({"role": "user", "text": question})
