@@ -135,12 +135,45 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 _nb_conversations: dict[int, str] = {}
 
 
+_NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
+_NB_LOCAL_SECRET = os.getenv("NOTEBOOKLM_LOCAL_SECRET", "").strip()
+
+
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    """Запрашивает NotebookLM через notebooklm-mcp-2026 (прямой импорт)."""
+    """Запрашивает NotebookLM — через локальный прокси или прямой импорт."""
+    logger.info(f"NotebookLM query: {query[:80]}")
+
+    if _NB_LOCAL_URL:
+        # Режим прокси: запрос на локальный сервер пользователя (российский IP)
+        try:
+            import urllib.request
+            payload = json.dumps({"query": query, "chat_id": chat_id}).encode("utf-8")
+            req = urllib.request.Request(
+                f"{_NB_LOCAL_URL}/ask",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Secret": _NB_LOCAL_SECRET,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if data.get("ok"):
+                answer = data.get("answer", "").strip()
+                logger.info(f"NotebookLM proxy: получен ответ {len(answer)} симв.")
+                return answer or None
+            else:
+                logger.error(f"NotebookLM proxy error: {data.get('error')}")
+                return None
+        except Exception as e:
+            logger.exception(f"NotebookLM proxy exception: {e}")
+            return None
+
+    # Fallback: прямой импорт (работает только с российского IP)
     conv_id = _nb_conversations.get(chat_id)
     try:
         from notebooklm_mcp_2026.tools.query import query_notebook
-        logger.info(f"NotebookLM query: {query[:80]}")
         result = query_notebook(
             notebook_id=NOTEBOOK_ID,
             query=query,
@@ -323,6 +356,58 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой Telegram chat_id: `{update.effective_chat.id}`",
                                      parse_mode="Markdown")
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = []
+
+    # 1. Env vars
+    auth_json_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip())
+    data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
+    lines.append(f"NOTEBOOKLM_AUTH_JSON задан: {auth_json_set}")
+    lines.append(f"NOTEBOOKLM_MCP_DATA_DIR: {data_dir or '(не задан)'}")
+
+    # 2. auth.json на диске
+    if data_dir:
+        auth_path = os.path.join(data_dir, "auth.json")
+        exists = os.path.exists(auth_path)
+        lines.append(f"auth.json существует: {exists}")
+        if exists:
+            try:
+                with open(auth_path) as f:
+                    data = json.load(f)
+                cookies = data.get("cookies", {})
+                lines.append(f"Кук в файле: {list(cookies.keys())[:4]}...")
+            except Exception as e:
+                lines.append(f"Ошибка чтения auth.json: {e}")
+    else:
+        lines.append("auth.json: путь не задан")
+
+    # 3. Тест NotebookLM
+    lines.append("\nЗапрашиваю NotebookLM (тест)...")
+    await update.message.reply_text("\n".join(lines))
+    lines = []
+
+    try:
+        from notebooklm_mcp_2026.tools.query import query_notebook
+        result = query_notebook(notebook_id=NOTEBOOK_ID, query="Что такое слайды?")
+        status = result.get("status")
+        error = result.get("error", "")
+        hint = result.get("hint", "")
+        answer = result.get("answer", "")
+        lines.append(f"Статус: {status}")
+        if error:
+            lines.append(f"Ошибка: {error}")
+        if hint:
+            lines.append(f"Подсказка: {hint}")
+        if answer:
+            lines.append(f"Ответ (первые 200 симв.):\n{answer[:200]}")
+    except Exception as e:
+        import traceback
+        lines.append(f"Исключение: {e}")
+        lines.append(traceback.format_exc()[-800:])
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
