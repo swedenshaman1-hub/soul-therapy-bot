@@ -75,6 +75,30 @@ if _nb_auth_json and _nb_data_dir:
             print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
     except Exception as _e:
         print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
+        # Retry up to 2 more times with delay
+        for _retry in range(2):
+            try:
+                import time as _t
+                _t.sleep(10 * (_retry + 1))
+                print(f"Startup CSRF retry {_retry + 1}...", flush=True)
+                with _httpx.Client(cookies=_jar, headers=_hdrs, follow_redirects=True, timeout=20.0) as _hc:
+                    _pg = _hc.get("https://notebooklm.google.com/")
+                if _pg.status_code == 200 and "accounts.google.com" not in str(_pg.url):
+                    _m = re.search(r'"SNlM0e":"([^"]+)"', _pg.text)
+                    if _m:
+                        _auth_data["csrf_token"] = _m.group(1)
+                        _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
+                        if _m2:
+                            _auth_data["session_id"] = _m2.group(1)
+                        print(f"Startup CSRF OK (retry {_retry + 1}): {_auth_data['csrf_token'][:35]}...", flush=True)
+                    _bl = re.search(r'boq_labs-tailwind-frontend_[\w.]+', _pg.text)
+                    if _bl:
+                        _detected_bl = _bl.group(0).rstrip('.')
+                        os.environ["NOTEBOOKLM_BL"] = _detected_bl
+                        print(f"Build label auto-detected (retry {_retry + 1}): {_detected_bl}", flush=True)
+                    break
+            except Exception as _re:
+                print(f"Startup CSRF retry {_retry + 1} failed: {_re}", flush=True)
     with open(_auth_path, "w", encoding="utf-8") as _f:
         json.dump(_auth_data, _f)
 
@@ -146,6 +170,77 @@ def _strip_markdown(text: str) -> str:
     # Лишние пустые строки
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+
+def _refresh_notebooklm_auth_sync() -> bool:
+    """Обновляет CSRF и build label NotebookLM без перезапуска бота."""
+    nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
+    nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
+    if not nb_auth_json or not nb_data_dir:
+        return False
+
+    import httpx as _h
+    auth_data = json.loads(nb_auth_json)
+    jar = _h.Cookies()
+    for k, v in auth_data.get("cookies", {}).items():
+        jar.set(k, v, domain=".google.com")
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    try:
+        with _h.Client(cookies=jar, headers=hdrs, follow_redirects=True, timeout=25.0) as hc:
+            pg = hc.get("https://notebooklm.google.com/")
+    except Exception as e:
+        logger.warning(f"NB periodic refresh: page fetch failed: {e}")
+        return False
+
+    if pg.status_code != 200 or "accounts.google.com" in str(pg.url):
+        logger.warning(f"NB periodic refresh: unexpected page {pg.status_code} url={pg.url}")
+        return False
+
+    new_csrf = None
+    m = re.search(r'"SNlM0e":"([^"]+)"', pg.text)
+    if m:
+        new_csrf = m.group(1)
+        auth_data["csrf_token"] = new_csrf
+        m2 = re.search(r'"FdrFJe":"(\d+)"', pg.text)
+        if m2:
+            auth_data["session_id"] = m2.group(1)
+        try:
+            with open(os.path.join(nb_data_dir, "auth.json"), "w", encoding="utf-8") as f:
+                json.dump(auth_data, f)
+        except Exception as e:
+            logger.warning(f"NB periodic refresh: couldn't write auth.json: {e}")
+
+    bl_m = re.search(r'boq_labs-tailwind-frontend_[\w.]+', pg.text)
+    new_bl = bl_m.group(0).rstrip('.') if bl_m else None
+    if new_bl:
+        os.environ["NOTEBOOKLM_BL"] = new_bl
+
+    # Patch running notebooklm modules if already imported
+    import sys as _sys
+    nb_cfg = _sys.modules.get("notebooklm_mcp_2026.config")
+    nb_srv = _sys.modules.get("notebooklm_mcp_2026.server")
+    if nb_cfg and new_bl:
+        bl_changed = nb_cfg.BUILD_LABEL != new_bl
+        nb_cfg.BUILD_LABEL = new_bl
+        if nb_srv:
+            if bl_changed:
+                logger.info(f"NB periodic refresh: BL changed → {new_bl}, resetting client")
+                nb_srv.reset_client()
+            elif new_csrf and nb_srv._client:
+                nb_srv._client.csrf_token = new_csrf
+                logger.info(f"NB periodic refresh: CSRF patched on client {new_csrf[:30]}...")
+
+    logger.info(f"NB periodic refresh OK: BL={new_bl or 'N/A'} CSRF={'OK' if new_csrf else 'N/A'}")
+    return True
+
+
+async def _periodic_nb_refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job: каждые 3 часа обновляем CSRF и build label."""
+    await _run_blocking(_refresh_notebooklm_auth_sync)
 
 
 COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Валентиновича Теребенина.
@@ -578,6 +673,11 @@ def main():
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Периодически обновляем CSRF и build label (каждые 3 часа, первый запуск через 5 мин)
+    if app.job_queue:
+        app.job_queue.run_repeating(_periodic_nb_refresh_job, interval=10800, first=300)
+        print("Periodic NotebookLM auth refresh scheduled (every 3h)", flush=True)
 
     print("Бот запущен. Ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
