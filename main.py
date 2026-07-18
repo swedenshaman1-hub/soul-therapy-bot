@@ -399,7 +399,7 @@ def _tts_chunk(text: str) -> str:
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=300_000),
     )
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash-preview-tts",
@@ -417,7 +417,13 @@ def _tts_chunk(text: str) -> str:
             )
             break
         except Exception as e:
-            if any(x in str(e) for x in ("DEADLINE_EXCEEDED", "504", "timeout")) and attempt < 2:
+            err_lower = str(e).lower()
+            transient = any(x in err_lower for x in (
+                "deadline_exceeded", "504", "503", "timeout", "timed out",
+                "unavailable", "resource_exhausted", "429",
+            ))
+            if transient and attempt < 3:
+                time.sleep(15 * (attempt + 1))
                 continue
             raise
 
