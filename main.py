@@ -63,6 +63,14 @@ if _nb_auth_json and _nb_data_dir:
                 print(f"Startup CSRF OK: {_auth_data['csrf_token'][:35]}...", flush=True)
             else:
                 print("Startup CSRF: SNlM0e not in page, using stored token", flush=True)
+            # Авто-определяем build label — Google меняет его раз в несколько недель.
+            # Устанавливаем env var ДО первого импорта notebooklm пакета,
+            # поэтому пакет подхватит актуальное значение автоматически.
+            _bl = re.search(r'boq_labs-tailwind-frontend_[\w.]+', _pg.text)
+            if _bl:
+                _detected_bl = _bl.group(0).rstrip('.')
+                os.environ["NOTEBOOKLM_BL"] = _detected_bl
+                print(f"Build label auto-detected: {_detected_bl}", flush=True)
         else:
             print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
     except Exception as _e:
