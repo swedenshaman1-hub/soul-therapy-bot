@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from collections import defaultdict
@@ -40,6 +41,17 @@ if _nb_auth_json and _nb_data_dir:
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
     _auth_data = json.loads(_nb_auth_json)
+    # Keep refreshed credentials from a persistent Railway volume. The env var
+    # is only a bootstrap copy and may be older after a restart or deployment.
+    if os.path.exists(_auth_path):
+        try:
+            with open(_auth_path, encoding="utf-8") as _f:
+                _disk_auth = json.load(_f)
+            if float(_disk_auth.get("extracted_at", 0) or 0) >= float(_auth_data.get("extracted_at", 0) or 0):
+                _auth_data = _disk_auth
+                print("Startup auth: using newer persistent auth.json", flush=True)
+        except Exception as _e:
+            print(f"Startup auth: persistent auth.json ignored: {_e}", flush=True)
     # Пробуем получить свежий CSRF с NotebookLM до запуска клиента.
     # GenerateFreeFormStreamed строго валидирует CSRF, а batchexecute — нет.
     try:
@@ -181,6 +193,15 @@ def _refresh_notebooklm_auth_sync() -> bool:
 
     import httpx as _h
     auth_data = json.loads(nb_auth_json)
+    auth_path = os.path.join(nb_data_dir, "auth.json")
+    if os.path.exists(auth_path):
+        try:
+            with open(auth_path, encoding="utf-8") as f:
+                disk_auth = json.load(f)
+            if float(disk_auth.get("extracted_at", 0) or 0) >= float(auth_data.get("extracted_at", 0) or 0):
+                auth_data = disk_auth
+        except Exception as e:
+            logger.warning(f"NB refresh: persistent auth ignored: {e}")
     jar = _h.Cookies()
     for k, v in auth_data.get("cookies", {}).items():
         jar.set(k, v, domain=".google.com")
@@ -240,7 +261,15 @@ def _refresh_notebooklm_auth_sync() -> bool:
 
 async def _periodic_nb_refresh_job(context: ContextTypes.DEFAULT_TYPE):
     """Job: каждые 3 часа обновляем CSRF и build label."""
-    await _run_blocking(_refresh_notebooklm_auth_sync)
+    def _locked_refresh():
+        global _nb_last_refresh_at
+        with _nb_query_lock:
+            ok = _refresh_notebooklm_auth_sync()
+            if ok:
+                _nb_last_refresh_at = time.time()
+            return ok
+
+    await _run_blocking(_locked_refresh)
 
 
 COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Валентиновича Теребенина.
@@ -286,6 +315,10 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 
 # conversation_id для продолжения диалога в NotebookLM (по chat_id)
 _nb_conversations: dict[int, str] = {}
+_nb_query_lock = threading.Lock()
+_nb_last_refresh_at = 0.0
+_nb_last_error = ""
+_NB_REFRESH_MAX_AGE = 20 * 60
 
 
 _NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
@@ -363,6 +396,71 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
 
 
 # ─── Транскрипция голоса ──────────────────────────────────────────────────────
+
+def _ask_notebooklm_resilient(query: str, chat_id: int = 0) -> str | None:
+    """Query NotebookLM with proactive auth refresh and bounded recovery."""
+    global _nb_last_refresh_at, _nb_last_error
+
+    # Keep the existing optional proxy mode intact.
+    if _NB_LOCAL_URL:
+        return _ask_notebooklm_direct(query, chat_id)
+
+    with _nb_query_lock:
+        from notebooklm_mcp_2026.tools.query import query_notebook
+        from notebooklm_mcp_2026 import server as _nb_server
+
+        if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
+            if _refresh_notebooklm_auth_sync():
+                _nb_last_refresh_at = time.time()
+                _nb_server.reset_client()
+
+        for attempt in range(3):
+            try:
+                conversation_id = _nb_conversations.get(chat_id) if attempt == 0 else None
+                result = query_notebook(
+                    notebook_id=NOTEBOOK_ID,
+                    query=query,
+                    conversation_id=conversation_id,
+                )
+                answer = (result.get("answer") or "").strip()
+                logger.info(
+                    "NotebookLM result status=%s attempt=%s answer_chars=%s",
+                    result.get("status"), attempt + 1, len(answer),
+                )
+                if result.get("status") == "success" and answer:
+                    new_conversation = result.get("conversation_id")
+                    if new_conversation:
+                        _nb_conversations[chat_id] = new_conversation
+                    _nb_last_error = ""
+                    return answer
+
+                _nb_last_error = str(
+                    result.get("error") or result.get("hint") or "empty response"
+                )
+                logger.warning(
+                    "NotebookLM attempt %s failed: %s", attempt + 1, _nb_last_error
+                )
+            except Exception as exc:
+                _nb_last_error = f"{type(exc).__name__}: {exc}"
+                logger.exception("NotebookLM attempt %s exception", attempt + 1)
+
+            if attempt < 2:
+                # Retry from a clean conversation and a fresh singleton client.
+                _nb_conversations.pop(chat_id, None)
+                _nb_server.reset_client()
+                if _refresh_notebooklm_auth_sync():
+                    _nb_last_refresh_at = time.time()
+                time.sleep(1.5 * (attempt + 1))
+
+        logger.error("NotebookLM failed after 3 attempts: %s", _nb_last_error)
+        return None
+
+
+# All handlers use the resilient implementation. Keeping the original function
+# above preserves the optional local proxy path without duplicating that code.
+_ask_notebooklm_direct = _ask_notebooklm
+_ask_notebooklm = _ask_notebooklm_resilient
+
 
 def _transcribe(file_path: str) -> str:
     with open(file_path, "rb") as f:
@@ -682,8 +780,8 @@ def main():
 
     # Периодически обновляем CSRF и build label (каждые 3 часа, первый запуск через 5 мин)
     if app.job_queue:
-        app.job_queue.run_repeating(_periodic_nb_refresh_job, interval=10800, first=300)
-        print("Periodic NotebookLM auth refresh scheduled (every 3h)", flush=True)
+        app.job_queue.run_repeating(_periodic_nb_refresh_job, interval=1800, first=10)
+        print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
 
     print("Бот запущен. Ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
