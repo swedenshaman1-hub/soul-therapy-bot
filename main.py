@@ -488,7 +488,17 @@ def _transcribe(file_path: str) -> str:
 
 # ─── TTS через Gemini ─────────────────────────────────────────────────────────
 
-_TTS_CHUNK_LIMIT = 4000  # символов на один TTS-запрос
+_TTS_CHUNK_LIMIT = 1200  # short takes keep Gemini's pace and pitch stable
+
+_TTS_STYLE_PROMPT = """Read the Russian transcript below exactly as written.
+Use a warm, calm, confident adult male voice suitable for a trusted mentor.
+Keep one natural medium-slow speaking pace, pitch, volume, and timbre from the
+first word through the final word. Do not accelerate, rush, lower the pitch, or
+fade near the end. Make short natural pauses between sentences and paragraphs.
+Do not read these directions aloud. Read only the transcript.
+
+Transcript:
+"""
 
 
 def _tts_chunk(text: str) -> str:
@@ -501,7 +511,7 @@ def _tts_chunk(text: str) -> str:
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash-preview-tts",
-                contents=text,
+                contents=_TTS_STYLE_PROMPT + text,
                 config=genai_types.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=genai_types.SpeechConfig(
@@ -558,10 +568,35 @@ def _split_for_tts(text: str) -> list[str]:
 def _text_to_speech(text: str) -> list[str]:
     """Возвращает список путей к WAV-файлам (один или несколько если текст длинный)."""
     parts = _split_for_tts(text)
-    paths: list[str] = []
-    for part in parts:
-        paths.append(_tts_chunk(part))
-    return paths
+    paths = [_tts_chunk(part) for part in parts]
+    if len(paths) == 1:
+        return paths
+
+    # Generate short, stable takes, then join them into one Telegram voice
+    # message. All chunks use the same mono/16-bit/24kHz format.
+    fd, merged_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(merged_path, "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(24000)
+            for path in paths:
+                with wave.open(path, "rb") as source:
+                    output.writeframes(source.readframes(source.getnframes()))
+        return [merged_path]
+    except Exception:
+        try:
+            os.unlink(merged_path)
+        except OSError:
+            pass
+        raise
+    finally:
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
