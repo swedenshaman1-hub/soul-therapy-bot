@@ -16,15 +16,17 @@ import tempfile
 import threading
 import time
 import wave
+import uuid
 from collections import defaultdict
 from functools import partial
 
 from dotenv import load_dotenv
 from google import genai as google_genai
 from google.genai import types as genai_types
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -134,6 +136,9 @@ MCP_PYTHON = _WIN_MCP_PYTHON if os.path.exists(_WIN_MCP_PYTHON) else sys.executa
 
 # История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
 _history: dict[int, list[dict]] = defaultdict(list)
+_tts_answers: dict[str, tuple[int, str]] = {}
+_tts_in_progress: set[str] = set()
+_TTS_CACHE_LIMIT = 100
 HISTORY_LIMIT = 6  # последних реплик (3 обмена)
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
@@ -606,9 +611,12 @@ async def _run_blocking(func, *args):
     return await loop.run_in_executor(None, partial(func, *args))
 
 
-async def _send_long(update: Update, text: str):
-    for i in range(0, len(text), 4000):
-        await update.message.reply_text(text[i:i + 4000])
+async def _send_long(update: Update, text: str, reply_markup=None):
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
+        await update.message.reply_text(chunk, reply_markup=markup)
+
 
 
 def _is_allowed(chat_id: int) -> bool:
@@ -646,29 +654,48 @@ async def _answer(update: Update, question: str):
     if len(history) > HISTORY_LIMIT:
         _history[chat_id] = history[-HISTORY_LIMIT:]
 
-    # Текстовый ответ
-    await _send_long(update, answer)
+    # Save this exact answer and offer optional voice generation on demand.
+    tts_token = uuid.uuid4().hex[:16]
+    _tts_answers[tts_token] = (chat_id, answer)
+    while len(_tts_answers) > _TTS_CACHE_LIMIT:
+        _tts_answers.pop(next(iter(_tts_answers)))
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔊 Озвучить текст", callback_data=f"tts:{tts_token}")
+    ]])
+    await _send_long(update, answer, reply_markup=keyboard)
 
-    # Голосовой ответ
+# ─── Обработчики Telegram ────────────────────────────────────────────────────
+
+async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    token = (query.data or "").removeprefix("tts:")
+    saved = _tts_answers.get(token)
+    if not saved or saved[0] != update.effective_chat.id:
+        await query.answer("Этот ответ уже недоступен", show_alert=True)
+        return
+    if token in _tts_in_progress:
+        await query.answer("Озвучка уже готовится", show_alert=False)
+        return
+
+    await query.answer()
+    _tts_in_progress.add(token)
     audio_paths: list[str] = []
     try:
-        await update.message.reply_text("Озвучиваю... 🎙")
-        audio_paths = await _run_blocking(_text_to_speech, answer)
+        await query.message.reply_text("Озвучиваю... 🎙")
+        audio_paths = await _run_blocking(_text_to_speech, saved[1])
         for path in audio_paths:
-            with open(path, "rb") as f:
-                await update.message.reply_voice(f)
+            with open(path, "rb") as audio_file:
+                await query.message.reply_voice(audio_file)
     except Exception as e:
-        logger.exception("TTS error")
-        await update.message.reply_text(f"Голос не удалось сгенерировать: {e}")
+        logger.exception("TTS button error")
+        await query.message.reply_text(f"Голос не удалось сгенерировать: {e}")
     finally:
+        _tts_in_progress.discard(token)
         for path in audio_paths:
             try:
                 os.unlink(path)
-            except Exception:
+            except OSError:
                 pass
-
-
-# ─── Обработчики Telegram ────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -810,6 +837,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CallbackQueryHandler(handle_tts_button, pattern=r"^tts:"))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
