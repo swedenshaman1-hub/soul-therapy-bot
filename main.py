@@ -20,10 +20,18 @@ import uuid
 from collections import defaultdict, deque
 from functools import partial
 
+import access_control as access_db
+
 from dotenv import load_dotenv
 from google import genai as google_genai
 from google.genai import types as genai_types
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.error import Conflict
 from telegram.ext import (
     Application,
@@ -128,7 +136,11 @@ TELEGRAM_TOKEN = os.getenv("SOUL_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 # Ограничение доступа — только владелец. Узнать свой chat_id: написать боту /id
-ALLOWED_CHAT_IDS: set[int] = set()  # пусто = открыт для всех; добавь: {123456789}
+_admin_ids_env = os.getenv("ADMIN_CHAT_IDS", "1288155468")
+ADMIN_CHAT_IDS: set[int] = {
+    int(value.strip()) for value in _admin_ids_env.split(",") if value.strip()
+}
+BOT_USERNAME = os.getenv("BOT_USERNAME", "TerapiyaDushi_AI_bot").lstrip("@")
 
 NOTEBOOK_ID = "88a124fc-a20d-4836-99a3-25b079468568"
 # На Windows используем uv-окружение, на Linux (Railway) — системный Python
@@ -621,8 +633,45 @@ async def _send_long(update: Update, text: str, reply_markup=None):
 
 
 
+def _is_admin(chat_id: int) -> bool:
+    return chat_id in ADMIN_CHAT_IDS
+
+
 def _is_allowed(chat_id: int) -> bool:
-    return not ALLOWED_CHAT_IDS or chat_id in ALLOWED_CHAT_IDS
+    return _is_admin(chat_id) or access_db.has_active_access(chat_id)
+
+
+async def _send_access_denied(message):
+    await message.reply_text(
+        "Доступ к ассистенту не активирован или уже истёк. "
+        "Попроси у администратора персональную ссылку-приглашение."
+    )
+
+
+async def _configure_bot_commands(application: Application):
+    """Показывает обычные команды всем, а администратору — полный набор."""
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Начать работу"),
+            BotCommand("help", "Проверить доступ"),
+            BotCommand("reset", "Начать диалог заново"),
+            BotCommand("id", "Показать Telegram ID"),
+        ])
+        for admin_id in ADMIN_CHAT_IDS:
+            await application.bot.set_my_commands(
+                [
+                    BotCommand("admin", "Панель администратора"),
+                    BotCommand("invite7", "Создать доступ на 7 дней"),
+                    BotCommand("users", "Активные пользователи"),
+                    BotCommand("start", "Начать работу"),
+                    BotCommand("reset", "Начать диалог заново"),
+                    BotCommand("id", "Показать Telegram ID"),
+                    BotCommand("debug", "Диагностика NotebookLM"),
+                ],
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+    except Exception as error:
+        logger.warning("Could not configure Telegram commands: %s", error)
 
 
 async def _answer(update: Update, question: str):
@@ -725,9 +774,196 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except OSError:
                 pass
 
+def _admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 Создать доступ на 7 дней", callback_data="admin:invite7")],
+        [InlineKeyboardButton("👥 Активные пользователи", callback_data="admin:users")],
+        [InlineKeyboardButton("ℹ️ Инструкция", callback_data="admin:help")],
+    ])
+
+
+async def _send_admin_panel(message, context: ContextTypes.DEFAULT_TYPE, pin: bool = False):
+    panel = await message.reply_text(
+        "Панель администратора\n\n"
+        "Здесь можно создать одноразовую ссылку на 7 дней, посмотреть "
+        "активных пользователей, продлить или отключить доступ.",
+        reply_markup=_admin_keyboard(),
+    )
+    if pin:
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=message.chat_id,
+                message_id=panel.message_id,
+                disable_notification=True,
+            )
+        except Exception as error:
+            logger.warning("Could not pin admin panel: %s", error)
+    return panel
+
+
+async def _send_active_users(message):
+    users = access_db.list_active_users()
+    if not users:
+        await message.reply_text(
+            "Сейчас нет активных тестировщиков.",
+            reply_markup=_admin_keyboard(),
+        )
+        return
+
+    lines = ["Активные пользователи:"]
+    buttons = []
+    for user in users:
+        chat_id = int(user["chat_id"])
+        name = user["display_name"] or "Без имени"
+        username = f' @{user["username"]}' if user["username"] else ""
+        expiry = access_db.format_expiry(int(user["expires_at"]))
+        lines.append(
+            chr(10).join([
+                f"{name}{username}",
+                f"ID: {chat_id}",
+                f"До: {expiry}",
+            ])
+        )
+        buttons.append([
+            InlineKeyboardButton(
+                f"➕ 7 дней: {name[:18]}",
+                callback_data=f"admin:extend:{chat_id}",
+            ),
+            InlineKeyboardButton(
+                "⛔ Отключить",
+                callback_data=f"admin:revoke:{chat_id}",
+            ),
+        ])
+    buttons.append([InlineKeyboardButton("⬅️ Панель", callback_data="admin:panel")])
+    await message.reply_text(
+        (chr(10) * 2).join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_chat.id):
+        await update.message.reply_text("Эта команда доступна только администратору.")
+        return
+    await _send_admin_panel(update.message, context, pin=True)
+
+
+async def cmd_invite7(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_chat.id):
+        return
+    token = access_db.create_invite(update.effective_chat.id, 7)
+    link = f"https://t.me/{BOT_USERNAME}?start={token}"
+    await update.message.reply_text(
+        "Одноразовая ссылка на доступ в течение 7 дней:\n\n"
+        f"{link}\n\n"
+        "Срок начнётся с момента первой активации. Ссылка привяжется "
+        "к Telegram-аккаунту первого человека, который её откроет."
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_chat.id):
+        return
+    await _send_active_users(update.message)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _is_admin(update.effective_chat.id):
+        await update.message.reply_text(
+            """Команды администратора:
+/admin — открыть и закрепить панель
+/invite7 — создать ссылку на 7 дней
+/users — активные пользователи
+/id — показать Telegram ID"""
+        )
+        return
+    access = access_db.get_access(update.effective_chat.id)
+    if access and int(access["expires_at"]) > int(time.time()):
+        await update.message.reply_text(
+            "Твой доступ действует до "
+            f"{access_db.format_expiry(int(access['expires_at']))}."
+        )
+    else:
+        await _send_access_denied(update.message)
+
+
+async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not _is_admin(update.effective_chat.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+
+    if data == "admin:panel":
+        await _send_admin_panel(query.message, context)
+    elif data == "admin:invite7":
+        token = access_db.create_invite(update.effective_chat.id, 7)
+        link = f"https://t.me/{BOT_USERNAME}?start={token}"
+        await query.message.reply_text(
+            f"""Готовая одноразовая ссылка на 7 дней:
+
+{link}
+
+Перешли её тестировщику."""
+        )
+    elif data == "admin:users":
+        await _send_active_users(query.message)
+    elif data == "admin:help":
+        await query.message.reply_text(
+            "Нажми «Создать доступ на 7 дней» и перешли полученную ссылку. "
+            "После активации человек появится в списке пользователей. "
+            "Там же можно продлить или отключить его доступ."
+        )
+    elif data.startswith("admin:extend:"):
+        chat_id = int(data.rsplit(":", 1)[1])
+        expires_at = access_db.extend_access(chat_id, 7)
+        if expires_at:
+            await query.message.reply_text(
+                "Доступ продлён до " + access_db.format_expiry(expires_at)
+            )
+        await _send_active_users(query.message)
+    elif data.startswith("admin:revoke:"):
+        chat_id = int(data.rsplit(":", 1)[1])
+        access_db.revoke_access(chat_id)
+        await query.message.reply_text(f"Доступ пользователя {chat_id} отключён.")
+        await _send_active_users(query.message)
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     _history[chat_id].clear()
+
+    if context.args and not _is_admin(chat_id):
+        token = context.args[0].strip()
+        user = update.effective_user
+        status, expires_at = access_db.activate_invite(
+            token,
+            chat_id,
+            user.full_name or "Без имени",
+            user.username,
+        )
+        if status == "activated":
+            await update.message.reply_text(
+                "Доступ активирован на 7 дней.\n"
+                f"Он действует до {access_db.format_expiry(expires_at)}."
+            )
+        elif status == "already":
+            await update.message.reply_text(
+                "Эта ссылка уже активирована тобой. Доступ действует до "
+                f"{access_db.format_expiry(expires_at)}."
+            )
+        elif status == "used":
+            await update.message.reply_text(
+                "Эта ссылка уже использована другим человеком."
+            )
+            return
+        else:
+            await update.message.reply_text("Ссылка недействительна.")
+            return
+
+    if not _is_allowed(chat_id):
+        await _send_access_denied(update.message)
+        return
     await update.message.reply_text(
         "Привет! Я коуч по методу Терапии Души Евгения Теребенина.\n\n"
         "Задавай вопросы текстом или голосом — отвечу по авторским материалам метода.\n\n"
@@ -743,6 +979,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    if not _is_allowed(chat_id):
+        await _send_access_denied(update.message)
+        return
     _history[chat_id].clear()
     _nb_conversations.pop(chat_id, None)
     await update.message.reply_text("Диалог сброшен. Начинаем с чистого листа. О чём поговорим?")
@@ -755,6 +994,8 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_chat.id):
+        return
     lines = []
 
     # 1. Env vars
@@ -808,6 +1049,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update.effective_chat.id):
+        await _send_access_denied(update.message)
         return
     question = (update.message.text or "").strip()
     if not question:
@@ -817,6 +1059,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed(update.effective_chat.id):
+        await _send_access_denied(update.message)
         return
 
     await update.message.reply_text("Расшифровываю... 🎤")
@@ -850,15 +1093,15 @@ def main():
         sys.exit(1)
 
     print("Коуч Терапии Души запускается...")
-    if ALLOWED_CHAT_IDS:
-        print(f"Доступ ограничен: {ALLOWED_CHAT_IDS}")
-    else:
-        print("Доступ открыт для всех (задай ALLOWED_CHAT_IDS для ограничения)")
+    access_db.init_db()
+    print(f"Администраторы: {ADMIN_CHAT_IDS}")
+    print(f"База доступов: {access_db.DB_PATH}")
 
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
         .concurrent_updates(True)
+        .post_init(_configure_bot_commands)
         .build()
     )
 
@@ -866,6 +1109,11 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("invite7", cmd_invite7))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(handle_admin_button, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(handle_tts_button, pattern=r"^tts:"))
     app.add_error_handler(handle_application_error)
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
