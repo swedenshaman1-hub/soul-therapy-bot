@@ -51,7 +51,7 @@ if _nb_auth_json and _nb_data_dir:
     import httpx as _httpx
     os.makedirs(_nb_data_dir, exist_ok=True)
     _auth_path = os.path.join(_nb_data_dir, "auth.json")
-    _auth_data = json.loads(_nb_auth_json)
+    _auth_data = json.loads(_nb_auth_json.lstrip("\ufeff"))
     # Keep refreshed credentials from a persistent Railway volume. The env var
     # is only a bootstrap copy and may be older after a restart or deployment.
     if os.path.exists(_auth_path):
