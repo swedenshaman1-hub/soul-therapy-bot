@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -135,12 +136,11 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("SOUL_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-# Ограничение доступа — только владелец. Узнать свой chat_id: написать боту /id
-_admin_ids_env = os.getenv("ADMIN_CHAT_IDS", "1288155468")
-ADMIN_CHAT_IDS: set[int] = {
-    int(value.strip()) for value in _admin_ids_env.split(",") if value.strip()
-}
+# Единственный администратор определяется только по Telegram user ID.
+ADMIN_ID = 1288155468
+ADMIN_CHAT_IDS: set[int] = {ADMIN_ID}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TerapiyaDushi_AI_bot").lstrip("@")
+BOT_DISPLAY_NAME = "Терапия Души Ассистент"
 
 NOTEBOOK_ID = "88a124fc-a20d-4836-99a3-25b079468568"
 # На Windows используем uv-окружение, на Linux (Railway) — системный Python
@@ -633,20 +633,28 @@ async def _run_blocking(func, *args):
     return await loop.run_in_executor(None, partial(func, *args))
 
 
-async def _send_long(update: Update, text: str, reply_markup=None):
+async def _send_long(
+    update: Update,
+    text: str,
+    reply_markup=None,
+    user_id: int | None = None,
+) -> bool:
     chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]
     for index, chunk in enumerate(chunks):
+        if user_id is not None and not _is_allowed(user_id):
+            return False
         markup = reply_markup if index == len(chunks) - 1 else None
         await update.message.reply_text(chunk, reply_markup=markup)
+    return True
 
 
 
-def _is_admin(chat_id: int) -> bool:
-    return chat_id in ADMIN_CHAT_IDS
+def _is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
-def _is_allowed(chat_id: int) -> bool:
-    return _is_admin(chat_id) or access_db.has_active_access(chat_id)
+def _is_allowed(user_id: int) -> bool:
+    return _is_admin(user_id) or access_db.has_active_access(user_id)
 
 
 async def _send_access_denied(message):
@@ -667,13 +675,14 @@ async def _configure_bot_commands(application: Application):
         for admin_id in ADMIN_CHAT_IDS:
             await application.bot.set_my_commands(
                 [
+                    BotCommand("start", "Начать работу"),
+                    BotCommand("reset", "Начать диалог заново"),
+                    BotCommand("help", "Проверить доступ"),
                     BotCommand("admin", "Панель администратора"),
                     BotCommand("invite7", "Создать доступ на 7 дней"),
                     BotCommand("users", "Активные пользователи"),
-                    BotCommand("start", "Начать работу"),
-                    BotCommand("reset", "Начать диалог заново"),
-                    BotCommand("id", "Показать Telegram ID"),
                     BotCommand("debug", "Диагностика NotebookLM"),
+                    BotCommand("id", "Показать Telegram ID"),
                 ],
                 scope=BotCommandScopeChat(chat_id=admin_id),
             )
@@ -682,14 +691,22 @@ async def _configure_bot_commands(application: Application):
 
 
 async def _answer(update: Update, question: str):
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     history = _history[chat_id]
+
+    if not _is_allowed(user_id):
+        return
 
     # Шаг 1: запрос в NotebookLM
     await update.message.reply_text("Ищу в материалах метода... ⏳")
     query = _build_notebooklm_query(question, history)
+    if not _is_allowed(user_id):
+        return
     raw = await _run_blocking(_ask_notebooklm, query, chat_id)
 
+    if not _is_allowed(user_id):
+        return
     if not raw:
         await update.message.reply_text(
             "Не удалось получить ответ из базы знаний. "
@@ -706,6 +723,10 @@ async def _answer(update: Update, question: str):
         answer = raw  # fallback — отдаём сырой ответ
     answer = _strip_markdown(answer)
 
+    # Доступ мог быть отозван, пока NotebookLM и Gemini готовили ответ.
+    if not _is_allowed(user_id):
+        return
+
     # Сохраняем в историю
     history.append({"role": "user", "text": question})
     history.append({"role": "assistant", "text": answer[:500]})  # сокращаем чтоб не разбухало
@@ -714,13 +735,20 @@ async def _answer(update: Update, question: str):
 
     # Save this exact answer and offer optional voice generation on demand.
     tts_token = uuid.uuid4().hex[:16]
-    _tts_answers[tts_token] = (chat_id, answer)
+    _tts_answers[tts_token] = (user_id, answer)
     while len(_tts_answers) > _TTS_CACHE_LIMIT:
         _tts_answers.pop(next(iter(_tts_answers)))
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔊 Озвучить текст", callback_data=f"tts:{tts_token}")
     ]])
-    await _send_long(update, answer, reply_markup=keyboard)
+    sent = await _send_long(
+        update,
+        answer,
+        reply_markup=keyboard,
+        user_id=user_id,
+    )
+    if not sent:
+        _tts_answers.pop(tts_token, None)
 
 # ─── Обработчики Telegram ────────────────────────────────────────────────────
 
@@ -752,9 +780,14 @@ async def handle_application_error(update: object, context: ContextTypes.DEFAULT
 
 async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await query.answer("Доступ уже не активен", show_alert=True)
+        return
+
     token = (query.data or "").removeprefix("tts:")
     saved = _tts_answers.get(token)
-    if not saved or saved[0] != update.effective_chat.id:
+    if not saved or saved[0] != user_id:
         await query.answer("Этот ответ уже недоступен", show_alert=True)
         return
     if token in _tts_in_progress:
@@ -765,14 +798,19 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _tts_in_progress.add(token)
     audio_paths: list[str] = []
     try:
+        if not _is_allowed(user_id):
+            return
         await query.message.reply_text("Озвучиваю... 🎙")
         audio_paths = await _run_blocking(_text_to_speech, saved[1])
         for path in audio_paths:
+            if not _is_allowed(user_id):
+                return
             with open(path, "rb") as audio_file:
                 await query.message.reply_voice(audio_file)
     except Exception as e:
         logger.exception("TTS button error")
-        await query.message.reply_text(f"Голос не удалось сгенерировать: {e}")
+        if _is_allowed(user_id):
+            await query.message.reply_text(f"Голос не удалось сгенерировать: {e}")
     finally:
         _tts_in_progress.discard(token)
         for path in audio_paths:
@@ -787,6 +825,35 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Активные пользователи", callback_data="admin:users")],
         [InlineKeyboardButton("ℹ️ Инструкция", callback_data="admin:help")],
     ])
+
+
+def _build_invitation(token: str) -> tuple[str, InlineKeyboardMarkup, str]:
+    deep_link = f"https://t.me/{BOT_USERNAME}?start={token}"
+    safe_link = html.escape(deep_link, quote=True)
+    safe_name = html.escape(BOT_DISPLAY_NAME)
+    text = (
+        f"🚀 <b>Приглашение в «{safe_name}»</b>\n\n"
+        "Персональный AI-ассистент поможет изучать метод Терапии Души, "
+        "задавать вопросы текстом и голосом и получать ответы по материалам метода.\n\n"
+        "🎁 Доступ предоставляется на 7 дней с момента активации.\n\n"
+        "Приглашение персональное и действует для одного Telegram-аккаунта.\n\n"
+        f'👉 <a href="{safe_link}"><b>Принять приглашение</b></a>'
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚀 Принять приглашение", url=deep_link)
+    ]])
+    return text, keyboard, deep_link
+
+
+async def _send_invitation(message, created_by: int):
+    token = access_db.create_invite(created_by, 7)
+    text, keyboard, _ = _build_invitation(token)
+    await message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
 
 
 async def _send_admin_panel(message, context: ContextTypes.DEFAULT_TYPE, pin: bool = False):
@@ -849,42 +916,37 @@ async def _send_active_users(message):
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_chat.id):
-        await update.message.reply_text("Эта команда доступна только администратору.")
+    if not _is_admin(update.effective_user.id):
         return
     await _send_admin_panel(update.message, context, pin=True)
 
 
 async def cmd_invite7(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_chat.id):
+    user_id = update.effective_user.id
+    if not _is_admin(user_id):
         return
-    token = access_db.create_invite(update.effective_chat.id, 7)
-    link = f"https://t.me/{BOT_USERNAME}?start={token}"
-    await update.message.reply_text(
-        "Одноразовая ссылка на доступ в течение 7 дней:\n\n"
-        f"{link}\n\n"
-        "Срок начнётся с момента первой активации. Ссылка привяжется "
-        "к Telegram-аккаунту первого человека, который её откроет."
-    )
+    await _send_invitation(update.message, user_id)
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_chat.id):
+    if not _is_admin(update.effective_user.id):
         return
     await _send_active_users(update.message)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _is_admin(update.effective_chat.id):
+    user_id = update.effective_user.id
+    if _is_admin(user_id):
         await update.message.reply_text(
             """Команды администратора:
 /admin — открыть и закрепить панель
 /invite7 — создать ссылку на 7 дней
 /users — активные пользователи
+/debug — диагностика
 /id — показать Telegram ID"""
         )
         return
-    access = access_db.get_access(update.effective_chat.id)
+    access = access_db.get_access(user_id)
     if access and int(access["expires_at"]) > int(time.time()):
         await update.message.reply_text(
             "Твой доступ действует до "
@@ -896,8 +958,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not _is_admin(update.effective_chat.id):
-        await query.answer("Недостаточно прав", show_alert=True)
+    user_id = update.effective_user.id
+    if not _is_admin(user_id):
+        await query.answer()
         return
     await query.answer()
     data = query.data or ""
@@ -905,15 +968,7 @@ async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     if data == "admin:panel":
         await _send_admin_panel(query.message, context)
     elif data == "admin:invite7":
-        token = access_db.create_invite(update.effective_chat.id, 7)
-        link = f"https://t.me/{BOT_USERNAME}?start={token}"
-        await query.message.reply_text(
-            f"""Готовая одноразовая ссылка на 7 дней:
-
-{link}
-
-Перешли её тестировщику."""
-        )
+        await _send_invitation(query.message, user_id)
     elif data == "admin:users":
         await _send_active_users(query.message)
     elif data == "admin:help":
@@ -937,15 +992,16 @@ async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _send_active_users(query.message)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     _history[chat_id].clear()
 
-    if context.args and not _is_admin(chat_id):
+    if context.args and not _is_admin(user_id):
         token = context.args[0].strip()
         user = update.effective_user
         status, expires_at = access_db.activate_invite(
             token,
-            chat_id,
+            user_id,
             user.full_name or "Без имени",
             user.username,
         )
@@ -968,7 +1024,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ссылка недействительна.")
             return
 
-    if not _is_allowed(chat_id):
+    if not _is_allowed(user_id):
         await _send_access_denied(update.message)
         return
     await update.message.reply_text(
@@ -984,8 +1040,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    if not _is_allowed(chat_id):
+    if not _is_allowed(user_id):
         await _send_access_denied(update.message)
         return
     _history[chat_id].clear()
@@ -994,15 +1051,15 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_chat.id):
+    if not _is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        f"Твой Telegram chat ID: {update.effective_chat.id}"
+        f"Твой Telegram ID: {update.effective_user.id}"
     )
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update.effective_chat.id):
+    if not _is_admin(update.effective_user.id):
         return
     lines = []
 
@@ -1056,7 +1113,8 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_chat.id):
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
         await _send_access_denied(update.message)
         return
     question = (update.message.text or "").strip()
@@ -1066,7 +1124,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed(update.effective_chat.id):
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
         await _send_access_denied(update.message)
         return
 
@@ -1078,11 +1137,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
     try:
         question = await _run_blocking(_transcribe, tmp_path)
+        if not _is_allowed(user_id):
+            return
         await update.message.reply_text(question)
         await _answer(update, question)
     except Exception as e:
         logger.exception("Transcription error")
-        await update.message.reply_text(f"Не удалось расшифровать: {e}")
+        if _is_allowed(user_id):
+            await update.message.reply_text(f"Не удалось расшифровать: {e}")
     finally:
         try:
             os.unlink(tmp_path)

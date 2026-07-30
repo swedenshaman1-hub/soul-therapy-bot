@@ -4,7 +4,9 @@ import os
 import secrets
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Iterator
 
 DB_PATH = os.getenv("ACCESS_DB_PATH", "/app/data/access.db")
 MOSCOW = timezone(timedelta(hours=3), name="MSK")
@@ -19,8 +21,19 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _db() -> Iterator[sqlite3.Connection]:
+    """Transaction scope that always closes the SQLite connection."""
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def init_db() -> None:
-    with _connect() as connection:
+    with _db() as connection:
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS invites (
@@ -55,7 +68,7 @@ def format_expiry(timestamp: int) -> str:
 def create_invite(created_by: int, duration_days: int = 7) -> str:
     token = secrets.token_urlsafe(18)
     now = int(time.time())
-    with _connect() as connection:
+    with _db() as connection:
         connection.execute(
             "INSERT INTO invites(token, duration_days, created_by, created_at) VALUES (?, ?, ?, ?)",
             (token, duration_days, created_by, now),
@@ -70,7 +83,7 @@ def activate_invite(
     username: str | None,
 ) -> tuple[str, int | None]:
     now = int(time.time())
-    with _connect() as connection:
+    with _db() as connection:
         connection.execute("BEGIN IMMEDIATE")
         invite = connection.execute(
             "SELECT * FROM invites WHERE token = ?", (token,)
@@ -109,7 +122,7 @@ def activate_invite(
 
 
 def get_access(chat_id: int) -> sqlite3.Row | None:
-    with _connect() as connection:
+    with _db() as connection:
         return connection.execute(
             "SELECT * FROM access_users WHERE chat_id = ?", (chat_id,)
         ).fetchone()
@@ -122,7 +135,7 @@ def has_active_access(chat_id: int) -> bool:
 
 def list_active_users() -> list[sqlite3.Row]:
     now = int(time.time())
-    with _connect() as connection:
+    with _db() as connection:
         return connection.execute(
             """
             SELECT * FROM access_users
@@ -135,7 +148,7 @@ def list_active_users() -> list[sqlite3.Row]:
 
 def revoke_access(chat_id: int) -> bool:
     now = int(time.time())
-    with _connect() as connection:
+    with _db() as connection:
         cursor = connection.execute(
             "UPDATE access_users SET expires_at = ?, updated_at = ? WHERE chat_id = ?",
             (now, now, chat_id),
@@ -145,7 +158,7 @@ def revoke_access(chat_id: int) -> bool:
 
 def extend_access(chat_id: int, days: int = 7) -> int | None:
     now = int(time.time())
-    with _connect() as connection:
+    with _db() as connection:
         access = connection.execute(
             "SELECT expires_at FROM access_users WHERE chat_id = ?", (chat_id,)
         ).fetchone()
