@@ -17,13 +17,14 @@ import threading
 import time
 import wave
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import partial
 
 from dotenv import load_dotenv
 from google import genai as google_genai
 from google.genai import types as genai_types
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -139,6 +140,7 @@ _history: dict[int, list[dict]] = defaultdict(list)
 _tts_answers: dict[str, tuple[int, str]] = {}
 _tts_in_progress: set[str] = set()
 _TTS_CACHE_LIMIT = 100
+_telegram_conflicts: deque[float] = deque(maxlen=10)
 HISTORY_LIMIT = 6  # последних реплик (3 обмена)
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
@@ -666,6 +668,32 @@ async def _answer(update: Update, question: str):
 
 # ─── Обработчики Telegram ────────────────────────────────────────────────────
 
+async def handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Restart a green-but-deaf container after persistent Telegram conflicts."""
+    error = context.error
+    if isinstance(error, Conflict):
+        now = time.monotonic()
+        _telegram_conflicts.append(now)
+        while _telegram_conflicts and now - _telegram_conflicts[0] > 45:
+            _telegram_conflicts.popleft()
+        conflict_count = len(_telegram_conflicts)
+        logger.warning(
+            "Telegram getUpdates conflict %s/3 within 45s", conflict_count
+        )
+        if conflict_count >= 3:
+            logger.critical(
+                "Persistent Telegram polling conflict; exiting so Railway restarts the bot"
+            )
+            await asyncio.sleep(0.5)
+            os._exit(1)
+        return
+
+    logger.error(
+        "Unhandled Telegram application error: %s",
+        error,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+
 async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     token = (query.data or "").removeprefix("tts:")
@@ -721,8 +749,9 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Твой Telegram chat_id: `{update.effective_chat.id}`",
-                                     parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Твой Telegram chat ID: {update.effective_chat.id}"
+    )
 
 
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -798,7 +827,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_path = tmp.name
     try:
         question = await _run_blocking(_transcribe, tmp_path)
-        await update.message.reply_text(f"_{question}_", parse_mode="Markdown")
+        await update.message.reply_text(question)
         await _answer(update, question)
     except Exception as e:
         logger.exception("Transcription error")
@@ -838,6 +867,7 @@ def main():
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(handle_tts_button, pattern=r"^tts:"))
+    app.add_error_handler(handle_application_error)
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
