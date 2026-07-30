@@ -211,7 +211,7 @@ def _refresh_notebooklm_auth_sync() -> bool:
         return False
 
     import httpx as _h
-    auth_data = json.loads(nb_auth_json)
+    auth_data = json.loads(nb_auth_json.lstrip("\ufeff"))
     auth_path = os.path.join(nb_data_dir, "auth.json")
     if os.path.exists(auth_path):
         try:
