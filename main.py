@@ -403,20 +403,105 @@ def _split_for_tts(text: str) -> list[str]:
     return chunks
 
 
+def _merge_and_compress_audio(wav_paths: list[str]) -> str:
+    """Joins stable WAV takes and converts them to one compact OGG/Opus voice."""
+    if not wav_paths:
+        raise ValueError("Нет аудиофрагментов для объединения")
+
+    merged_path: str | None = None
+    ogg_path: str | None = None
+    try:
+        source_path = wav_paths[0]
+        if len(wav_paths) > 1:
+            fd, merged_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            with wave.open(wav_paths[0], "rb") as first:
+                expected_format = (
+                    first.getnchannels(),
+                    first.getsampwidth(),
+                    first.getframerate(),
+                    first.getcomptype(),
+                )
+                with wave.open(merged_path, "wb") as output:
+                    output.setnchannels(expected_format[0])
+                    output.setsampwidth(expected_format[1])
+                    output.setframerate(expected_format[2])
+                    output.setcomptype(expected_format[3], first.getcompname())
+                    for path in wav_paths:
+                        with wave.open(path, "rb") as source:
+                            actual_format = (
+                                source.getnchannels(),
+                                source.getsampwidth(),
+                                source.getframerate(),
+                                source.getcomptype(),
+                            )
+                            if actual_format != expected_format:
+                                raise RuntimeError("Форматы частей озвучки не совпадают")
+                            output.writeframes(source.readframes(source.getnframes()))
+            source_path = merged_path
+
+        fd, ogg_path = tempfile.mkstemp(suffix=".ogg")
+        os.close(fd)
+        completed = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                source_path,
+                "-map",
+                "0:a:0",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "48k",
+                "-vbr",
+                "on",
+                "-compression_level",
+                "10",
+                "-application",
+                "voip",
+                ogg_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0 or os.path.getsize(ogg_path) == 0:
+            details = (completed.stderr or "неизвестная ошибка FFmpeg").strip()
+            raise RuntimeError(f"FFmpeg не создал OGG: {details[-500:]}")
+        return ogg_path
+    except Exception:
+        if ogg_path:
+            try:
+                os.unlink(ogg_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        if merged_path:
+            try:
+                os.unlink(merged_path)
+            except OSError:
+                pass
+
+
 def _text_to_speech(text: str) -> list[str]:
-    """Generates separate small WAV files; callers must delete every path."""
-    paths: list[str] = []
+    """Generates stable takes and returns one compressed Telegram voice file."""
+    wav_paths: list[str] = []
     try:
         for part in _split_for_tts(text):
-            paths.append(_tts_chunk(part))
-        return paths
-    except Exception:
-        for path in paths:
+            wav_paths.append(_tts_chunk(part))
+        return [_merge_and_compress_audio(wav_paths)]
+    finally:
+        for path in wav_paths:
             try:
                 os.unlink(path)
             except OSError:
                 pass
-        raise
 
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
@@ -606,11 +691,7 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     payload = (query.data or "").removeprefix("tts:")
-    token, separator, start_text = payload.partition(":")
-    try:
-        start_index = int(start_text) if separator else 0
-    except ValueError:
-        start_index = 0
+    token = payload.partition(":")[0]
     saved = _tts_answers.get(token)
     if not saved or saved[0] != user_id:
         await query.answer("Этот ответ уже недоступен", show_alert=True)
@@ -622,48 +703,38 @@ async def handle_tts_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
     _tts_in_progress.add(progress_key)
-    parts = _split_for_tts(saved[1])
-    start_index = max(0, min(start_index, max(0, len(parts) - 1)))
-    current_index = start_index
+    audio_paths: list[str] = []
     try:
         if not _is_allowed(user_id):
             return
         await query.message.reply_text(
-            f"Озвучиваю весь текст: частей {len(parts)}. Отправлю их по порядку. 🎙"
+            "Готовлю одно голосовое сообщение с полной озвучкой текста. 🎙"
         )
-        for current_index in range(start_index, len(parts)):
-            if not _is_allowed(user_id):
-                return
-            path = await _run_blocking(_tts_chunk, parts[current_index])
-            try:
-                await _send_voice_with_retry(
-                    query.message,
-                    path,
-                    current_index + 1,
-                    len(parts),
-                )
-            finally:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+        audio_paths = await _run_blocking(_text_to_speech, saved[1])
+        if not _is_allowed(user_id):
+            return
+        await _send_voice_with_retry(query.message, audio_paths[0], 1, 1)
     except Exception:
         logger.exception("TTS button error")
         if _is_allowed(user_id):
             retry_keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    "▶️ Продолжить озвучку",
-                    callback_data=f"tts:{token}:{current_index}",
+                    "🔁 Повторить озвучку",
+                    callback_data=f"tts:{token}",
                 )
             ]])
             await query.message.reply_text(
-                f"Не удалось подготовить или отправить часть "
-                f"{current_index + 1} из {len(parts)}. Уже отправленные части не пропали. "
-                "Нажми «Продолжить озвучку», чтобы продолжить с этого места.",
+                "Не удалось подготовить или отправить голосовое сообщение. "
+                "Нажми «Повторить озвучку», чтобы попробовать ещё раз.",
                 reply_markup=retry_keyboard,
             )
     finally:
         _tts_in_progress.discard(progress_key)
+        for path in audio_paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 def _admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
