@@ -1,5 +1,6 @@
 google-genai>=1.0.0
 edge-tts>=7.2.3
+httpx>=0.24.0
 python-dotenv>=1.0.0
 python-telegram-bot[job-queue]>=20.0
 notebooklm-mcp-2026>=0.2.1

@@ -43,6 +43,7 @@ class NotebookConnectorTests(unittest.TestCase):
                 "NOTEBOOKLM_AUTH_JSON": "",
                 "NOTEBOOKLM_MCP_DATA_DIR": self.temp_dir.name,
                 "NOTEBOOKLM_BL": "",
+                "NOTEBOOKLM_AUTO_METADATA": "0",
             },
             clear=False,
         )
@@ -103,6 +104,7 @@ class NotebookConnectorTests(unittest.TestCase):
         second_payload = json.loads(run.call_args_list[2].kwargs["input"])
         self.assertEqual(second_payload["conversation_id"], "c1")
         self.assertEqual(second_payload["source_ids"], ["s1", "s2"])
+        self.assertEqual(second_payload["base_url"], "https://notebook.google.com")
 
     @patch("notebook_connector.subprocess.run")
     def test_preflight_reports_unauthorized_without_hanging(self, run):
@@ -114,6 +116,34 @@ class NotebookConnectorTests(unittest.TestCase):
 
         self.assertFalse(connector.verify_sources(force=True))
         self.assertIn("401", connector.last_error)
+
+    @patch("notebook_connector.subprocess.run")
+    def test_preflight_refreshes_metadata_and_retries_unauthorized(self, run):
+        run.side_effect = [
+            completed({"status": "error", "error": "HTTP 401 Unauthorized"}),
+            completed({
+                "status": "success",
+                "_source_ids": ["s1", "s2"],
+                "_timings": {"sources": 0.6},
+            }),
+        ]
+        connector = NotebookConnector("notebook-id")
+
+        with patch.object(
+            connector,
+            "_refresh_frontend_metadata",
+            return_value=True,
+        ) as refresh:
+            self.assertTrue(connector.verify_sources(force=True))
+
+        refresh.assert_called_once_with()
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(connector.source_count, 2)
+
+    def test_auth_expiry_variants_are_detected(self):
+        self.assertTrue(NotebookConnector._is_auth_error("RPC Error 16: authentication expired"))
+        self.assertTrue(NotebookConnector._is_auth_error("HTTP 401 Unauthorized"))
+        self.assertFalse(NotebookConnector._is_auth_error("temporary timeout"))
 
 
 if __name__ == "__main__":

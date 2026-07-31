@@ -12,14 +12,38 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
+import httpx
+
 
 logger = logging.getLogger(__name__)
+
+_BUILD_LABEL_RE = re.compile(
+    r"boq_labs-tailwind-frontend_[A-Za-z0-9._-]+_p\d+"
+)
+_NOTEBOOK_PAGE_URL = "https://notebook.google.com"
+_HOST_SCOPED_COOKIES = frozenset({"OSID", "__Secure-OSID"})
+_PAGE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 
 class NotebookConnectorError(RuntimeError):
@@ -41,6 +65,8 @@ class NotebookConnector:
         self._last_error = ""
         self._auth = self._load_auth()
         self._persist_auth()
+        if os.getenv("NOTEBOOKLM_AUTO_METADATA", "1") != "0":
+            self._refresh_frontend_metadata()
 
     @staticmethod
     def _load_auth() -> dict:
@@ -82,6 +108,80 @@ class NotebookConnector:
             encoding="utf-8",
         )
 
+    @staticmethod
+    def _is_auth_error(error: str) -> bool:
+        lowered = error.lower()
+        return any(marker in lowered for marker in (
+            "401",
+            "403",
+            "not authenticated",
+            "authentication expired",
+            "auth expired",
+            "rpc error 16",
+        ))
+
+    def _refresh_frontend_metadata(self) -> bool:
+        """Refresh build label, CSRF and session metadata from Google."""
+        jar = httpx.Cookies()
+        for name, value in self._auth.get("cookies", {}).items():
+            domain = "notebook.google.com" if name in _HOST_SCOPED_COOKIES else ".google.com"
+            jar.set(name, value, domain=domain)
+
+        try:
+            with httpx.Client(
+                cookies=jar,
+                headers=_PAGE_HEADERS,
+                follow_redirects=True,
+                timeout=httpx.Timeout(60.0, connect=20.0),
+            ) as client:
+                response = client.get(f"{_NOTEBOOK_PAGE_URL}/")
+                if "accounts.google.com" in str(response.url):
+                    self._last_error = "NotebookLM authentication expired"
+                    return False
+                response.raise_for_status()
+                html = response.text
+
+                # The first navigation can return only the application shell.
+                # A second request with the cookies set by that shell contains
+                # the current frontend label used by NotebookLM RPC calls.
+                label = _BUILD_LABEL_RE.search(html)
+                if not label:
+                    second = client.get(f"{_NOTEBOOK_PAGE_URL}/")
+                    second.raise_for_status()
+                    html = second.text
+                    label = _BUILD_LABEL_RE.search(html)
+
+                # Preserve any cookie rotation returned by Google.
+                cookies = self._auth.setdefault("cookies", {})
+                for cookie in client.cookies.jar:
+                    cookies[cookie.name] = cookie.value
+
+            if label:
+                os.environ["NOTEBOOKLM_BL"] = label.group(0)
+
+            from notebooklm_mcp_2026.auth import (
+                extract_csrf_from_html,
+                extract_session_id_from_html,
+            )
+
+            csrf = extract_csrf_from_html(html)
+            if csrf:
+                self._auth["csrf_token"] = csrf
+            session_id = extract_session_id_from_html(html)
+            if session_id:
+                self._auth["session_id"] = session_id
+            self._auth["extracted_at"] = time.time()
+            self._persist_auth()
+            logger.info(
+                "NotebookLM metadata refreshed: build=%s csrf=%s",
+                os.getenv("NOTEBOOKLM_BL", "default"),
+                bool(csrf),
+            )
+            return bool(label or csrf)
+        except Exception as exc:
+            logger.warning("NotebookLM metadata refresh failed: %s", exc)
+            return False
+
     def _run_once(
         self,
         query: str,
@@ -100,6 +200,12 @@ payload = json.load(sys.stdin)
 build_label = payload.get("build_label")
 if build_label:
     os.environ["NOTEBOOKLM_BL"] = build_label
+base_url = (payload.get("base_url") or "").rstrip("/")
+if base_url:
+    os.environ["NOTEBOOKLM_BASE_URL"] = base_url
+    from notebooklm_mcp_2026 import config
+    config.BASE_URL = base_url
+    config.BATCHEXECUTE_URL = f"{base_url}/_/LabsTailwindUi/data/batchexecute"
 
 from notebooklm_mcp_2026 import server
 from notebooklm_mcp_2026.client import NotebookLMClient, _extract_source_ids
@@ -155,9 +261,13 @@ print(json.dumps(result, ensure_ascii=False))
             "conversation_id": conversation_id,
             "auth": self._auth,
             "build_label": os.getenv("NOTEBOOKLM_BL", "").strip(),
+            "base_url": os.getenv("NOTEBOOKLM_BASE_URL", _NOTEBOOK_PAGE_URL).strip(),
             "source_ids": list(source_ids or []),
             "sources_only": sources_only,
         }
+        process_env = os.environ.copy()
+        process_env["PYTHONIOENCODING"] = "utf-8"
+        process_env["PYTHONUTF8"] = "1"
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", script],
@@ -165,6 +275,7 @@ print(json.dumps(result, ensure_ascii=False))
                 text=True,
                 capture_output=True,
                 timeout=self.timeout,
+                env=process_env,
             )
         except subprocess.TimeoutExpired:
             return {
@@ -200,6 +311,9 @@ print(json.dumps(result, ensure_ascii=False))
             if self._source_ids and not force:
                 return True
             result = self._run_once("", None, sources_only=True)
+            first_error = str(result.get("error") or result.get("hint") or "")
+            if self._is_auth_error(first_error) and self._refresh_frontend_metadata():
+                result = self._run_once("", None, sources_only=True)
             source_ids = result.get("_source_ids") or []
             if result.get("status") == "success" and source_ids:
                 self._source_ids = list(source_ids)
@@ -267,11 +381,12 @@ print(json.dumps(result, ensure_ascii=False))
                 )
                 with self._state_lock:
                     self._conversations.pop(chat_id, None)
-                if "401" in self._last_error or "not authenticated" in self._last_error.lower():
+                if self._is_auth_error(self._last_error):
                     with self._source_lock:
                         self._source_ids = []
                     self._auth = self._load_auth()
                     self._persist_auth()
+                    self._refresh_frontend_metadata()
                     self.verify_sources(force=True)
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
