@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import concurrent.futures
 import html
 import json
 import logging
@@ -16,12 +17,12 @@ import sys
 import tempfile
 import threading
 import time
-import wave
 import uuid
 from collections import defaultdict, deque
 from functools import partial
 
 import access_control as access_db
+import edge_tts
 from notebook_connector import NotebookConnector, NotebookConnectorError
 
 from dotenv import load_dotenv
@@ -321,183 +322,155 @@ def _transcribe(file_path: str) -> str:
     raise TranscriptionError("Речь не распознана")
 
 
-# ─── TTS через Gemini ─────────────────────────────────────────────────────────
+# ─── Бесплатная озвучка через Microsoft Edge TTS ─────────────────────────────
 
-_TTS_CHUNK_LIMIT = 1200  # short takes keep Gemini's pace and pitch stable
-
-_TTS_STYLE_PROMPT = """Read the Russian transcript below exactly as written.
-Use a warm, calm, confident adult male voice suitable for a trusted mentor.
-Keep one natural medium-slow speaking pace, pitch, volume, and timbre from the
-first word through the final word. Do not accelerate, rush, lower the pitch, or
-fade near the end. Make short natural pauses between sentences and paragraphs.
-Do not read these directions aloud. Read only the transcript.
-
-Transcript:
-"""
+_EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "ru-RU-DmitryNeural")
+_EDGE_TTS_RATE = os.getenv("EDGE_TTS_RATE", "-5%")
+_EDGE_TTS_PITCH = os.getenv("EDGE_TTS_PITCH", "-2Hz")
+_EDGE_TTS_CHUNK_LIMIT = 1000
+_EDGE_TTS_MAX_WORKERS = 6
 
 
-def _tts_chunk(text: str) -> str:
-    """Генерирует один WAV-файл из текста (до _TTS_CHUNK_LIMIT символов)."""
-    client = google_genai.Client(
-        api_key=GEMINI_API_KEY,
-        http_options=genai_types.HttpOptions(timeout=300_000),
-    )
-    for attempt in range(4):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-tts",
-                contents=_TTS_STYLE_PROMPT + text,
-                config=genai_types.GenerateContentConfig(
-                    response_modalities=["AUDIO"],
-                    speech_config=genai_types.SpeechConfig(
-                        voice_config=genai_types.VoiceConfig(
-                            prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                                voice_name="Sadaltager"
-                            )
-                        )
-                    ),
-                ),
+def _edge_chunk_to_speech(text: str) -> str:
+    """Озвучивает одну часть текста в MP3 с повторами при временном сбое."""
+    clean_text = text.strip()
+    if not clean_text:
+        raise ValueError("Нет текста для озвучивания")
+
+    last_error: Exception | None = None
+    for attempt in range(3):
+        fd, path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+
+        async def _save() -> None:
+            communicate = edge_tts.Communicate(
+                clean_text,
+                voice=_EDGE_TTS_VOICE,
+                rate=_EDGE_TTS_RATE,
+                pitch=_EDGE_TTS_PITCH,
+                connect_timeout=15,
+                receive_timeout=60,
             )
-            break
-        except Exception as e:
-            err_lower = str(e).lower()
-            transient = any(x in err_lower for x in (
-                "deadline_exceeded", "504", "503", "timeout", "timed out",
-                "unavailable", "resource_exhausted", "429",
-            ))
-            if transient and attempt < 3:
-                time.sleep(15 * (attempt + 1))
+            await communicate.save(path)
+
+        try:
+            asyncio.run(_save())
+            if os.path.getsize(path) < 1024:
+                raise RuntimeError("Edge TTS вернул пустой аудиофайл")
+            return path
+        except Exception as exc:
+            last_error = exc
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            if attempt < 2:
+                logger.warning(
+                    "Edge TTS failed; retrying (%s/3): %s",
+                    attempt + 2,
+                    type(exc).__name__,
+                )
+                time.sleep(3 * (attempt + 1))
                 continue
             raise
 
-    pcm_data = response.candidates[0].content.parts[0].inline_data.data
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(pcm_data)
-    return path
+    raise RuntimeError("Edge TTS не ответил") from last_error
 
 
 def _split_for_tts(text: str) -> list[str]:
-    """Делит текст на короткие части, не разрезая слова и по возможности предложения."""
+    """Делит ответ по границам предложений, не теряя ни одного слова."""
     remaining = re.sub(r"[ \t]+", " ", text).strip()
-    if len(remaining) <= _TTS_CHUNK_LIMIT:
-        return [remaining] if remaining else []
-    chunks: list[str] = []
-    while len(remaining) > _TTS_CHUNK_LIMIT:
-        cut = remaining[:_TTS_CHUNK_LIMIT]
-        boundary = max(cut.rfind(mark) for mark in (".", "!", "?", "\n"))
-        if boundary > _TTS_CHUNK_LIMIT // 2:
-            cut = cut[:boundary + 1]
+    if not remaining:
+        return []
+
+    parts: list[str] = []
+    while len(remaining) > _EDGE_TTS_CHUNK_LIMIT:
+        window = remaining[:_EDGE_TTS_CHUNK_LIMIT]
+        boundary = max(window.rfind(mark) for mark in (".", "!", "?", "\n"))
+        if boundary >= _EDGE_TTS_CHUNK_LIMIT // 2:
+            cut = window[:boundary + 1]
         else:
-            last_space = cut.rfind(" ")
-            if last_space > 0:
-                cut = cut[:last_space]
-        chunks.append(cut.strip())
+            space = window.rfind(" ")
+            cut = window[:space] if space > 0 else window
+        parts.append(cut.strip())
         remaining = remaining[len(cut):].strip()
     if remaining:
-        chunks.append(remaining)
-    return chunks
+        parts.append(remaining)
+    return parts
 
 
-def _merge_and_compress_audio(wav_paths: list[str]) -> str:
-    """Joins stable WAV takes and converts them to one compact OGG/Opus voice."""
-    if not wav_paths:
+def _merge_edge_audio(paths: list[str]) -> str:
+    """Собирает готовые части в одно компактное OGG/Opus-сообщение."""
+    if not paths:
         raise ValueError("Нет аудиофрагментов для объединения")
+    if len(paths) == 1:
+        return paths[0]
 
-    merged_path: str | None = None
-    ogg_path: str | None = None
+    fd, output_path = tempfile.mkstemp(suffix=".ogg")
+    os.close(fd)
+    inputs: list[str] = []
+    for path in paths:
+        inputs.extend(["-i", path])
+    streams = "".join(f"[{index}:a]" for index in range(len(paths)))
+    audio_filter = f"{streams}concat=n={len(paths)}:v=0:a=1[outa]"
     try:
-        source_path = wav_paths[0]
-        if len(wav_paths) > 1:
-            fd, merged_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            with wave.open(wav_paths[0], "rb") as first:
-                expected_format = (
-                    first.getnchannels(),
-                    first.getsampwidth(),
-                    first.getframerate(),
-                    first.getcomptype(),
-                )
-                with wave.open(merged_path, "wb") as output:
-                    output.setnchannels(expected_format[0])
-                    output.setsampwidth(expected_format[1])
-                    output.setframerate(expected_format[2])
-                    output.setcomptype(expected_format[3], first.getcompname())
-                    for path in wav_paths:
-                        with wave.open(path, "rb") as source:
-                            actual_format = (
-                                source.getnchannels(),
-                                source.getsampwidth(),
-                                source.getframerate(),
-                                source.getcomptype(),
-                            )
-                            if actual_format != expected_format:
-                                raise RuntimeError("Форматы частей озвучки не совпадают")
-                            output.writeframes(source.readframes(source.getnframes()))
-            source_path = merged_path
-
-        fd, ogg_path = tempfile.mkstemp(suffix=".ogg")
-        os.close(fd)
         completed = subprocess.run(
             [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                source_path,
-                "-map",
-                "0:a:0",
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "48k",
-                "-vbr",
-                "on",
-                "-compression_level",
-                "10",
-                "-application",
-                "voip",
-                ogg_path,
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                *inputs,
+                "-filter_complex", audio_filter,
+                "-map", "[outa]",
+                "-c:a", "libopus", "-b:a", "48k", "-vbr", "on",
+                "-application", "voip",
+                output_path,
             ],
             capture_output=True,
             text=True,
             timeout=180,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        if completed.returncode != 0 or os.path.getsize(ogg_path) == 0:
+        if completed.returncode != 0 or os.path.getsize(output_path) < 1024:
             details = (completed.stderr or "неизвестная ошибка FFmpeg").strip()
-            raise RuntimeError(f"FFmpeg не создал OGG: {details[-500:]}")
-        return ogg_path
+            raise RuntimeError(f"FFmpeg не собрал озвучку: {details[-500:]}")
+        return output_path
     except Exception:
-        if ogg_path:
-            try:
-                os.unlink(ogg_path)
-            except OSError:
-                pass
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
         raise
-    finally:
-        if merged_path:
-            try:
-                os.unlink(merged_path)
-            except OSError:
-                pass
 
 
 def _text_to_speech(text: str) -> list[str]:
-    """Generates stable takes and returns one compressed Telegram voice file."""
-    wav_paths: list[str] = []
+    """Параллельно озвучивает весь текст и возвращает один аудиофайл."""
+    parts = _split_for_tts(text)
+    if not parts:
+        raise ValueError("Нет текста для озвучивания")
+    if len(parts) == 1:
+        return [_edge_chunk_to_speech(parts[0])]
+
+    futures: list[concurrent.futures.Future[str]] = []
+    chunk_paths: list[str] = []
+    final_path: str | None = None
     try:
-        for part in _split_for_tts(text):
-            wav_paths.append(_tts_chunk(part))
-        return [_merge_and_compress_audio(wav_paths)]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(_EDGE_TTS_MAX_WORKERS, len(parts))
+        ) as executor:
+            futures = [executor.submit(_edge_chunk_to_speech, part) for part in parts]
+            chunk_paths = [future.result() for future in futures]
+        final_path = _merge_edge_audio(chunk_paths)
+        return [final_path]
     finally:
-        for path in wav_paths:
+        generated = set(chunk_paths)
+        for future in futures:
+            if future.done() and not future.cancelled():
+                try:
+                    generated.add(future.result())
+                except Exception:
+                    pass
+        for path in generated:
+            if path == final_path:
+                continue
             try:
                 os.unlink(path)
             except OSError:

@@ -1,9 +1,7 @@
 import asyncio
 import os
-import subprocess
 import tempfile
 import unittest
-import wave
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -74,103 +72,115 @@ class TranscriptionTests(unittest.TestCase):
             os.unlink(path)
 
 
-class TtsSplitTests(unittest.TestCase):
-    def test_short_text_stays_whole(self):
-        self.assertEqual(main._split_for_tts("Короткий текст."), ["Короткий текст."])
-
-    def test_long_text_is_not_lost(self):
-        text = " ".join(
-            f"Предложение номер {number} содержит несколько слов."
-            for number in range(100)
+class EdgeTtsTests(unittest.TestCase):
+    def test_chunk_is_sent_once_without_truncation(self):
+        full_text = " ".join(
+            f"Предложение номер {number} остаётся в полной озвучке."
+            for number in range(150)
         )
-        chunks = main._split_for_tts(text)
-        self.assertGreater(len(chunks), 1)
-        self.assertTrue(all(len(chunk) <= main._TTS_CHUNK_LIMIT for chunk in chunks))
-        self.assertEqual(" ".join(chunks), text)
+        calls = []
 
-    def test_long_sentence_is_not_cut_inside_word(self):
-        text = ("длинноеслово " * 250).strip()
-        chunks = main._split_for_tts(text)
-        self.assertTrue(all(not chunk.endswith("длинноесл") for chunk in chunks))
-        self.assertEqual(" ".join(chunks), text)
+        class FakeCommunicate:
+            def __init__(self, text, **kwargs):
+                calls.append((text, kwargs))
 
+            async def save(self, path):
+                with open(path, "wb") as target:
+                    target.write(b"ID3" + b"audio" * 300)
 
-class TtsCompressionTests(unittest.TestCase):
-    @staticmethod
-    def _make_wav(seconds: float = 0.5) -> str:
-        fd, path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        frames = int(24000 * seconds)
-        with wave.open(path, "wb") as output:
-            output.setnchannels(1)
-            output.setsampwidth(2)
-            output.setframerate(24000)
-            output.writeframes(b"\x00\x00" * frames)
-        return path
-
-    def test_wav_parts_become_one_small_ogg_with_full_duration(self):
-        wav_paths = [self._make_wav(0.6), self._make_wav(0.7)]
-        ogg_path = None
+        path = None
         try:
-            ogg_path = main._merge_and_compress_audio(wav_paths)
-            with open(ogg_path, "rb") as source:
-                self.assertEqual(source.read(4), b"OggS")
-            self.assertLess(
-                os.path.getsize(ogg_path),
-                sum(os.path.getsize(path) for path in wav_paths),
-            )
-            probe = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                    ogg_path,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            self.assertEqual(probe.returncode, 0, probe.stderr)
-            self.assertGreater(float(probe.stdout.strip()), 1.2)
+            with patch.object(main.edge_tts, "Communicate", FakeCommunicate):
+                path = main._edge_chunk_to_speech(full_text)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], full_text)
+            self.assertEqual(calls[0][1]["voice"], "ru-RU-DmitryNeural")
+            self.assertEqual(calls[0][1]["rate"], "-5%")
+            self.assertGreater(os.path.getsize(path), 1024)
         finally:
-            for path in wav_paths:
-                if os.path.exists(path):
-                    os.unlink(path)
-            if ogg_path and os.path.exists(ogg_path):
-                os.unlink(ogg_path)
+            if path and os.path.exists(path):
+                os.unlink(path)
 
-    def test_text_to_speech_removes_intermediate_wavs(self):
-        wav_paths = [self._make_wav(), self._make_wav()]
-        fd, final_path = tempfile.mkstemp(suffix=".ogg")
-        os.write(fd, b"OggS")
-        os.close(fd)
+    def test_temporary_edge_failure_is_retried(self):
+        attempts = 0
+
+        class FlakyCommunicate:
+            def __init__(self, _text, **_kwargs):
+                pass
+
+            async def save(self, path):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise RuntimeError("temporary network failure")
+                with open(path, "wb") as target:
+                    target.write(b"ID3" + b"audio" * 300)
+
+        path = None
         try:
             with (
-                patch.object(main, "_split_for_tts", return_value=["один", "два"]),
-                patch.object(main, "_tts_chunk", side_effect=wav_paths),
-                patch.object(
-                    main,
-                    "_merge_and_compress_audio",
-                    return_value=final_path,
-                ),
+                patch.object(main.edge_tts, "Communicate", FlakyCommunicate),
+                patch.object(main.time, "sleep"),
             ):
-                self.assertEqual(main._text_to_speech("текст"), [final_path])
-            self.assertTrue(all(not os.path.exists(path) for path in wav_paths))
+                path = main._edge_chunk_to_speech("Проверка повторных попыток")
+            self.assertEqual(attempts, 3)
+            self.assertTrue(os.path.exists(path))
         finally:
-            for path in wav_paths:
-                if os.path.exists(path):
-                    os.unlink(path)
-            if os.path.exists(final_path):
-                os.unlink(final_path)
+            if path and os.path.exists(path):
+                os.unlink(path)
+
+    def test_empty_text_is_rejected_without_network_call(self):
+        with (
+            patch.object(main.edge_tts, "Communicate") as communicate,
+            self.assertRaises(ValueError),
+        ):
+            main._edge_chunk_to_speech("   ")
+        communicate.assert_not_called()
+
+    def test_split_preserves_full_text(self):
+        full_text = " ".join(
+            f"Предложение номер {number} остаётся в полной озвучке."
+            for number in range(150)
+        )
+        parts = main._split_for_tts(full_text)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(part) <= main._EDGE_TTS_CHUNK_LIMIT for part in parts))
+        self.assertEqual(" ".join(parts), full_text)
+
+    def test_text_to_speech_returns_exactly_one_file(self):
+        with (
+            patch.object(main, "_split_for_tts", return_value=["Полный ответ"]),
+            patch.object(
+                main,
+                "_edge_chunk_to_speech",
+                return_value="voice.mp3",
+            ) as synthesize,
+        ):
+            self.assertEqual(main._text_to_speech("Полный ответ"), ["voice.mp3"])
+        synthesize.assert_called_once_with("Полный ответ")
+
+    def test_parallel_parts_are_merged_into_one_file(self):
+        with (
+            patch.object(main, "_split_for_tts", return_value=["один", "два"]),
+            patch.object(
+                main,
+                "_edge_chunk_to_speech",
+                side_effect=lambda text: f"{text}.mp3",
+            ) as synthesize,
+            patch.object(
+                main,
+                "_merge_edge_audio",
+                return_value="full.ogg",
+            ) as merge,
+        ):
+            self.assertEqual(main._text_to_speech("полный ответ"), ["full.ogg"])
+        self.assertEqual(synthesize.call_count, 2)
+        merge.assert_called_once_with(["один.mp3", "два.mp3"])
 
 
 class TtsUploadTests(unittest.IsolatedAsyncioTestCase):
     async def test_upload_timeout_retries_same_file(self):
-        fd, path = tempfile.mkstemp(suffix=".wav")
+        fd, path = tempfile.mkstemp(suffix=".mp3")
         os.write(fd, b"audio")
         os.close(fd)
         message = SimpleNamespace(
@@ -195,8 +205,8 @@ class TtsButtonHandlerTests(unittest.IsolatedAsyncioTestCase):
         token = "singlevoice"
         main._tts_answers[token] = (main.ADMIN_ID, "Полный текст ответа.")
         main._tts_in_progress.clear()
-        fd, ogg_path = tempfile.mkstemp(suffix=".ogg")
-        os.write(fd, b"OggS")
+        fd, ogg_path = tempfile.mkstemp(suffix=".mp3")
+        os.write(fd, b"ID3")
         os.close(fd)
         message = SimpleNamespace(reply_text=AsyncMock())
         query = SimpleNamespace(
