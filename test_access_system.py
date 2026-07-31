@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 TEST_DIR = tempfile.mkdtemp(prefix="soul-bot-access-")
 os.environ["ACCESS_DB_PATH"] = os.path.join(TEST_DIR, "access.db")
 os.environ["NOTEBOOKLM_AUTH_JSON"] = ""
+os.environ["NOTEBOOKLM_AUTH_JSON_B64"] = ""
 os.environ["NOTEBOOKLM_MCP_DATA_DIR"] = ""
 os.environ["SOUL_BOT_TOKEN"] = "test-token"
 os.environ["GEMINI_API_KEY"] = "test-key"
@@ -326,6 +327,24 @@ class HandlerSecurityTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(bot.calls[1][1]["scope"].chat_id, main.ADMIN_ID)
+
+    async def test_notebooklm_health_alert_is_sent_once_and_recovers(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        context = SimpleNamespace(bot=bot)
+        main._nb_health_alert_active = False
+
+        with patch.object(main, "_run_blocking", AsyncMock(return_value=False)):
+            await main._periodic_nb_refresh_job(context)
+            await main._periodic_nb_refresh_job(context)
+
+        self.assertEqual(bot.send_message.await_count, 1)
+        self.assertTrue(main._nb_health_alert_active)
+
+        with patch.object(main, "_run_blocking", AsyncMock(return_value=True)):
+            await main._periodic_nb_refresh_job(context)
+
+        self.assertEqual(bot.send_message.await_count, 2)
+        self.assertFalse(main._nb_health_alert_active)
 
 
 if __name__ == "__main__":

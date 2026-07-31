@@ -22,6 +22,7 @@ from collections import defaultdict, deque
 from functools import partial
 
 import access_control as access_db
+from notebook_connector import NotebookConnector, NotebookConnectorError
 
 from dotenv import load_dotenv
 from google import genai as google_genai
@@ -45,87 +46,6 @@ from telegram.ext import (
 
 load_dotenv()
 
-# На Railway: восстанавливаем auth.json из переменной окружения
-_nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
-_nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
-if _nb_auth_json and _nb_data_dir:
-    import httpx as _httpx
-    os.makedirs(_nb_data_dir, exist_ok=True)
-    _auth_path = os.path.join(_nb_data_dir, "auth.json")
-    _auth_data = json.loads(_nb_auth_json.lstrip("\ufeff"))
-    # Keep refreshed credentials from a persistent Railway volume. The env var
-    # is only a bootstrap copy and may be older after a restart or deployment.
-    if os.path.exists(_auth_path):
-        try:
-            with open(_auth_path, encoding="utf-8") as _f:
-                _disk_auth = json.load(_f)
-            if float(_disk_auth.get("extracted_at", 0) or 0) >= float(_auth_data.get("extracted_at", 0) or 0):
-                _auth_data = _disk_auth
-                print("Startup auth: using newer persistent auth.json", flush=True)
-        except Exception as _e:
-            print(f"Startup auth: persistent auth.json ignored: {_e}", flush=True)
-    # Пробуем получить свежий CSRF с NotebookLM до запуска клиента.
-    # GenerateFreeFormStreamed строго валидирует CSRF, а batchexecute — нет.
-    try:
-        _jar = _httpx.Cookies()
-        for _k, _v in _auth_data.get("cookies", {}).items():
-            _jar.set(_k, _v, domain=".google.com")
-        _hdrs = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        with _httpx.Client(cookies=_jar, headers=_hdrs, follow_redirects=True, timeout=20.0) as _hc:
-            _pg = _hc.get("https://notebooklm.google.com/")
-        if _pg.status_code == 200 and "accounts.google.com" not in str(_pg.url):
-            _m = re.search(r'"SNlM0e":"([^"]+)"', _pg.text)
-            if _m:
-                _auth_data["csrf_token"] = _m.group(1)
-                _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
-                if _m2:
-                    _auth_data["session_id"] = _m2.group(1)
-                print(f"Startup CSRF OK: {_auth_data['csrf_token'][:35]}...", flush=True)
-            else:
-                print("Startup CSRF: SNlM0e not in page, using stored token", flush=True)
-            # Авто-определяем build label — Google меняет его раз в несколько недель.
-            # Устанавливаем env var ДО первого импорта notebooklm пакета,
-            # поэтому пакет подхватит актуальное значение автоматически.
-            _bl = re.search(r'boq_labs-tailwind-frontend_[\w.]+', _pg.text)
-            if _bl:
-                _detected_bl = _bl.group(0).rstrip('.')
-                os.environ["NOTEBOOKLM_BL"] = _detected_bl
-                print(f"Build label auto-detected: {_detected_bl}", flush=True)
-        else:
-            print(f"Startup CSRF: page {_pg.status_code}, using stored token", flush=True)
-    except Exception as _e:
-        print(f"Startup CSRF refresh failed, using stored token: {_e}", flush=True)
-        # Retry up to 2 more times with delay
-        for _retry in range(2):
-            try:
-                import time as _t
-                _t.sleep(10 * (_retry + 1))
-                print(f"Startup CSRF retry {_retry + 1}...", flush=True)
-                with _httpx.Client(cookies=_jar, headers=_hdrs, follow_redirects=True, timeout=20.0) as _hc:
-                    _pg = _hc.get("https://notebooklm.google.com/")
-                if _pg.status_code == 200 and "accounts.google.com" not in str(_pg.url):
-                    _m = re.search(r'"SNlM0e":"([^"]+)"', _pg.text)
-                    if _m:
-                        _auth_data["csrf_token"] = _m.group(1)
-                        _m2 = re.search(r'"FdrFJe":"(\d+)"', _pg.text)
-                        if _m2:
-                            _auth_data["session_id"] = _m2.group(1)
-                        print(f"Startup CSRF OK (retry {_retry + 1}): {_auth_data['csrf_token'][:35]}...", flush=True)
-                    _bl = re.search(r'boq_labs-tailwind-frontend_[\w.]+', _pg.text)
-                    if _bl:
-                        _detected_bl = _bl.group(0).rstrip('.')
-                        os.environ["NOTEBOOKLM_BL"] = _detected_bl
-                        print(f"Build label auto-detected (retry {_retry + 1}): {_detected_bl}", flush=True)
-                    break
-            except Exception as _re:
-                print(f"Startup CSRF retry {_retry + 1} failed: {_re}", flush=True)
-    with open(_auth_path, "w", encoding="utf-8") as _f:
-        json.dump(_auth_data, _f)
-
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
@@ -146,6 +66,17 @@ NOTEBOOK_ID = "88a124fc-a20d-4836-99a3-25b079468568"
 # На Windows используем uv-окружение, на Linux (Railway) — системный Python
 _WIN_MCP_PYTHON = r"C:\Users\Admin\AppData\Roaming\uv\tools\notebooklm-mcp-2026\Scripts\python.exe"
 MCP_PYTHON = _WIN_MCP_PYTHON if os.path.exists(_WIN_MCP_PYTHON) else sys.executable
+_notebook_connector: NotebookConnector | None = None
+_notebook_connector_lock = threading.Lock()
+
+
+def _get_notebook_connector() -> NotebookConnector:
+    global _notebook_connector
+    if _notebook_connector is None:
+        with _notebook_connector_lock:
+            if _notebook_connector is None:
+                _notebook_connector = NotebookConnector(NOTEBOOK_ID)
+    return _notebook_connector
 
 # История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
 _history: dict[int, list[dict]] = defaultdict(list)
@@ -208,91 +139,44 @@ def _strip_markdown(text: str) -> str:
 
 
 def _refresh_notebooklm_auth_sync() -> bool:
-    """Обновляет CSRF и build label NotebookLM без перезапуска бота."""
-    nb_auth_json = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
-    nb_data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
-    if not nb_auth_json or not nb_data_dir:
-        return False
-
-    import httpx as _h
-    auth_data = json.loads(nb_auth_json.lstrip("\ufeff"))
-    auth_path = os.path.join(nb_data_dir, "auth.json")
-    if os.path.exists(auth_path):
-        try:
-            with open(auth_path, encoding="utf-8") as f:
-                disk_auth = json.load(f)
-            if float(disk_auth.get("extracted_at", 0) or 0) >= float(auth_data.get("extracted_at", 0) or 0):
-                auth_data = disk_auth
-        except Exception as e:
-            logger.warning(f"NB refresh: persistent auth ignored: {e}")
-    jar = _h.Cookies()
-    for k, v in auth_data.get("cookies", {}).items():
-        jar.set(k, v, domain=".google.com")
-    hdrs = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    """Quick cloud preflight using the same connector as real questions."""
     try:
-        with _h.Client(cookies=jar, headers=hdrs, follow_redirects=True, timeout=25.0) as hc:
-            pg = hc.get("https://notebooklm.google.com/")
-    except Exception as e:
-        logger.warning(f"NB periodic refresh: page fetch failed: {e}")
+        return _get_notebook_connector().verify_sources(force=True)
+    except NotebookConnectorError as exc:
+        logger.error("NotebookLM cloud preflight configuration error: %s", exc)
         return False
-
-    if pg.status_code != 200 or "accounts.google.com" in str(pg.url):
-        logger.warning(f"NB periodic refresh: unexpected page {pg.status_code} url={pg.url}")
+    except Exception:
+        logger.exception("NotebookLM cloud preflight exception")
         return False
-
-    new_csrf = None
-    m = re.search(r'"SNlM0e":"([^"]+)"', pg.text)
-    if m:
-        new_csrf = m.group(1)
-        auth_data["csrf_token"] = new_csrf
-        m2 = re.search(r'"FdrFJe":"(\d+)"', pg.text)
-        if m2:
-            auth_data["session_id"] = m2.group(1)
-        try:
-            with open(os.path.join(nb_data_dir, "auth.json"), "w", encoding="utf-8") as f:
-                json.dump(auth_data, f)
-        except Exception as e:
-            logger.warning(f"NB periodic refresh: couldn't write auth.json: {e}")
-
-    bl_m = re.search(r'boq_labs-tailwind-frontend_[\w.]+', pg.text)
-    new_bl = bl_m.group(0).rstrip('.') if bl_m else None
-    if new_bl:
-        os.environ["NOTEBOOKLM_BL"] = new_bl
-
-    # Patch running notebooklm modules if already imported
-    import sys as _sys
-    nb_cfg = _sys.modules.get("notebooklm_mcp_2026.config")
-    nb_srv = _sys.modules.get("notebooklm_mcp_2026.server")
-    if nb_cfg and new_bl:
-        bl_changed = nb_cfg.BUILD_LABEL != new_bl
-        nb_cfg.BUILD_LABEL = new_bl
-        if nb_srv:
-            if bl_changed:
-                logger.info(f"NB periodic refresh: BL changed → {new_bl}, resetting client")
-                nb_srv.reset_client()
-            elif new_csrf and nb_srv._client:
-                nb_srv._client.csrf_token = new_csrf
-                logger.info(f"NB periodic refresh: CSRF patched on client {new_csrf[:30]}...")
-
-    logger.info(f"NB periodic refresh OK: BL={new_bl or 'N/A'} CSRF={'OK' if new_csrf else 'N/A'}")
-    return True
 
 
 async def _periodic_nb_refresh_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job: каждые 3 часа обновляем CSRF и build label."""
-    def _locked_refresh():
-        global _nb_last_refresh_at
-        with _nb_query_lock:
-            ok = _refresh_notebooklm_auth_sync()
-            if ok:
-                _nb_last_refresh_at = time.time()
-            return ok
+    """Job: проверяет облачную связь с NotebookLM."""
+    global _nb_health_alert_active
 
-    await _run_blocking(_locked_refresh)
+    ok = await _run_blocking(_refresh_notebooklm_auth_sync)
+    if not ok and not _nb_health_alert_active:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "⚠️ NotebookLM временно недоступен на сервере. "
+                    "Бот продолжает работать, но ответы по базе знаний могут "
+                    "не приходить. Выполняется автоматическая диагностика."
+                ),
+            )
+            _nb_health_alert_active = True
+        except Exception:
+            logger.exception("Could not notify admin about NotebookLM outage")
+    elif ok and _nb_health_alert_active:
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="✅ Связь с NotebookLM восстановлена.",
+            )
+            _nb_health_alert_active = False
+        except Exception:
+            logger.exception("Could not notify admin about NotebookLM recovery")
 
 
 COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Валентиновича Теребенина.
@@ -340,153 +224,30 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 
 # ─── NotebookLM через MCP ─────────────────────────────────────────────────────
 
-# conversation_id для продолжения диалога в NotebookLM (по chat_id)
-_nb_conversations: dict[int, str] = {}
-_nb_query_lock = threading.Lock()
-_nb_last_refresh_at = 0.0
 _nb_last_error = ""
-_NB_REFRESH_MAX_AGE = 20 * 60
-
-
-_NB_LOCAL_URL = os.getenv("NOTEBOOKLM_LOCAL_URL", "").strip().rstrip("/")
-_NB_LOCAL_SECRET = os.getenv("NOTEBOOKLM_LOCAL_SECRET", "").strip()
+_nb_health_alert_active = False
 
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    """Запрашивает NotebookLM — через локальный прокси или прямой импорт."""
-    logger.info(f"NotebookLM query: {query[:80]}")
-
-    if _NB_LOCAL_URL:
-        # Режим прокси: запрос на локальный сервер пользователя (российский IP)
-        try:
-            import urllib.request
-            payload = json.dumps({"query": query, "chat_id": chat_id}).encode("utf-8")
-            req = urllib.request.Request(
-                f"{_NB_LOCAL_URL}/ask",
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Secret": _NB_LOCAL_SECRET,
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            if data.get("ok"):
-                answer = data.get("answer", "").strip()
-                logger.info(f"NotebookLM proxy: получен ответ {len(answer)} симв.")
-                return answer or None
-            else:
-                logger.error(f"NotebookLM proxy error: {data.get('error')}")
-                return None
-        except Exception as e:
-            logger.exception(f"NotebookLM proxy exception: {e}")
-            return None
-
-    # Fallback: прямой импорт
-    conv_id = _nb_conversations.get(chat_id)
-    from notebooklm_mcp_2026.tools.query import query_notebook
-    from notebooklm_mcp_2026 import server as _nb_server
-
-    for _attempt in range(2):
-        try:
-            result = query_notebook(
-                notebook_id=NOTEBOOK_ID,
-                query=query,
-                conversation_id=conv_id or None,
-            )
-            logger.info(f"NotebookLM result status: {result.get('status')} | attempt={_attempt}")
-            if result.get("status") == "success":
-                new_conv = result.get("conversation_id")
-                if new_conv:
-                    _nb_conversations[chat_id] = new_conv
-                return result.get("answer", "").strip() or None
-
-            error = result.get("error", "")
-            # При 401 обновляем CSRF и повторяем
-            if "401" in str(error) and _attempt == 0:
-                logger.info("NotebookLM 401, refreshing CSRF and retrying...")
-                try:
-                    _client = _nb_server.get_client()
-                    _client._refresh_auth_tokens()
-                except Exception as _re:
-                    logger.warning(f"CSRF refresh failed: {_re}")
-                    _nb_server.reset_client()
-                continue
-
-            logger.error(f"NotebookLM error: {error} | hint: {result.get('hint','')}")
-            return None
-        except Exception as e:
-            logger.exception(f"NotebookLM exception: {e}")
-            return None
-    return None
-
-
-# ─── Транскрипция голоса ──────────────────────────────────────────────────────
-
-def _ask_notebooklm_resilient(query: str, chat_id: int = 0) -> str | None:
-    """Query NotebookLM with proactive auth refresh and bounded recovery."""
-    global _nb_last_refresh_at, _nb_last_error
-
-    # Keep the existing optional proxy mode intact.
-    if _NB_LOCAL_URL:
-        return _ask_notebooklm_direct(query, chat_id)
-
-    with _nb_query_lock:
-        from notebooklm_mcp_2026.tools.query import query_notebook
-        from notebooklm_mcp_2026 import server as _nb_server
-
-        if time.time() - _nb_last_refresh_at > _NB_REFRESH_MAX_AGE:
-            if _refresh_notebooklm_auth_sync():
-                _nb_last_refresh_at = time.time()
-                _nb_server.reset_client()
-
-        for attempt in range(3):
-            try:
-                conversation_id = _nb_conversations.get(chat_id) if attempt == 0 else None
-                result = query_notebook(
-                    notebook_id=NOTEBOOK_ID,
-                    query=query,
-                    conversation_id=conversation_id,
-                )
-                answer = (result.get("answer") or "").strip()
-                logger.info(
-                    "NotebookLM result status=%s attempt=%s answer_chars=%s",
-                    result.get("status"), attempt + 1, len(answer),
-                )
-                if result.get("status") == "success" and answer:
-                    new_conversation = result.get("conversation_id")
-                    if new_conversation:
-                        _nb_conversations[chat_id] = new_conversation
-                    _nb_last_error = ""
-                    return answer
-
-                _nb_last_error = str(
-                    result.get("error") or result.get("hint") or "empty response"
-                )
-                logger.warning(
-                    "NotebookLM attempt %s failed: %s", attempt + 1, _nb_last_error
-                )
-            except Exception as exc:
-                _nb_last_error = f"{type(exc).__name__}: {exc}"
-                logger.exception("NotebookLM attempt %s exception", attempt + 1)
-
-            if attempt < 2:
-                # Retry from a clean conversation and a fresh singleton client.
-                _nb_conversations.pop(chat_id, None)
-                _nb_server.reset_client()
-                if _refresh_notebooklm_auth_sync():
-                    _nb_last_refresh_at = time.time()
-                time.sleep(1.5 * (attempt + 1))
-
-        logger.error("NotebookLM failed after 3 attempts: %s", _nb_last_error)
+    """Запрашивает NotebookLM через изолированный облачный коннектор."""
+    global _nb_last_error
+    logger.info("NotebookLM cloud query: %s", query[:80])
+    try:
+        connector = _get_notebook_connector()
+        answer = connector.query(query, chat_id)
+        _nb_last_error = connector.last_error
+        return answer
+    except NotebookConnectorError as exc:
+        _nb_last_error = str(exc)
+        logger.error("NotebookLM cloud configuration error: %s", exc)
+        return None
+    except Exception as exc:
+        _nb_last_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("NotebookLM cloud exception")
         return None
 
 
-# All handlers use the resilient implementation. Keeping the original function
-# above preserves the optional local proxy path without duplicating that code.
-_ask_notebooklm_direct = _ask_notebooklm
-_ask_notebooklm = _ask_notebooklm_resilient
+# ─── Транскрипция голоса ──────────────────────────────────────────────────────
 
 
 def _transcribe(file_path: str) -> str:
@@ -1046,7 +807,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_access_denied(update.message)
         return
     _history[chat_id].clear()
-    _nb_conversations.pop(chat_id, None)
+    if _notebook_connector is not None:
+        _notebook_connector.reset_conversation(chat_id)
     await update.message.reply_text("Диалог сброшен. Начинаем с чистого листа. О чём поговорим?")
 
 
@@ -1064,8 +826,10 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     # 1. Env vars
+    auth_b64_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON_B64", "").strip())
     auth_json_set = bool(os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip())
     data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
+    lines.append(f"NOTEBOOKLM_AUTH_JSON_B64 задан: {auth_b64_set}")
     lines.append(f"NOTEBOOKLM_AUTH_JSON задан: {auth_json_set}")
     lines.append(f"NOTEBOOKLM_MCP_DATA_DIR: {data_dir or '(не задан)'}")
 
@@ -1091,17 +855,16 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
 
     try:
-        from notebooklm_mcp_2026.tools.query import query_notebook
-        result = query_notebook(notebook_id=NOTEBOOK_ID, query="Что такое слайды?")
-        status = result.get("status")
-        error = result.get("error", "")
-        hint = result.get("hint", "")
-        answer = result.get("answer", "")
-        lines.append(f"Статус: {status}")
-        if error:
-            lines.append(f"Ошибка: {error}")
-        if hint:
-            lines.append(f"Подсказка: {hint}")
+        answer = await _run_blocking(
+            _ask_notebooklm,
+            "Что такое слайды?",
+            ADMIN_ID,
+        )
+        connector = _get_notebook_connector()
+        lines.append(f"Статус: {'success' if answer else 'error'}")
+        lines.append(f"Источников обнаружено: {connector.source_count}")
+        if connector.last_error:
+            lines.append(f"Ошибка: {connector.last_error[-700:]}")
         if answer:
             lines.append(f"Ответ (первые 200 симв.):\n{answer[:200]}")
     except Exception as e:
@@ -1189,10 +952,14 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Периодически обновляем CSRF и build label (каждые 3 часа, первый запуск через 5 мин)
+    # Быстрый облачный preflight: проверяет доступ к 299 источникам и прогревает кэш.
     if app.job_queue:
-        app.job_queue.run_repeating(_periodic_nb_refresh_job, interval=1800, first=10)
-        print("Periodic NotebookLM auth refresh scheduled (every 30m)", flush=True)
+        app.job_queue.run_repeating(
+            _periodic_nb_refresh_job,
+            interval=3 * 60 * 60,
+            first=10,
+        )
+        print("NotebookLM cloud preflight scheduled (every 3h)", flush=True)
 
     print("Бот запущен. Ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
