@@ -156,24 +156,19 @@ def _refresh_notebooklm_auth_sync() -> bool:
 
 
 async def _periodic_nb_refresh_job(context: ContextTypes.DEFAULT_TYPE):
-    """Job: проверяет облачную связь с NotebookLM."""
-    global _nb_health_alert_active
+    """Проверяет NotebookLM и сообщает только о подтверждённом сбое."""
+    global _nb_health_alert_active, _nb_health_failure_count
 
     ok = await _run_blocking(_refresh_notebooklm_auth_sync)
-    if not ok and not _nb_health_alert_active:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "⚠️ NotebookLM временно недоступен на сервере. "
-                    "Бот продолжает работать, но ответы по базе знаний могут "
-                    "не приходить. Выполняется автоматическая диагностика."
-                ),
+    if ok:
+        if _nb_health_failure_count:
+            logger.info(
+                "NotebookLM health recovered after %s transient failure(s)",
+                _nb_health_failure_count,
             )
-            _nb_health_alert_active = True
-        except Exception:
-            logger.exception("Could not notify admin about NotebookLM outage")
-    elif ok and _nb_health_alert_active:
+        _nb_health_failure_count = 0
+        if not _nb_health_alert_active:
+            return
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -182,6 +177,32 @@ async def _periodic_nb_refresh_job(context: ContextTypes.DEFAULT_TYPE):
             _nb_health_alert_active = False
         except Exception:
             logger.exception("Could not notify admin about NotebookLM recovery")
+        return
+
+    _nb_health_failure_count += 1
+    logger.warning(
+        "NotebookLM health check failed %s/%s",
+        _nb_health_failure_count,
+        _NB_HEALTH_FAILURE_THRESHOLD,
+    )
+    if (
+        _nb_health_failure_count < _NB_HEALTH_FAILURE_THRESHOLD
+        or _nb_health_alert_active
+    ):
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "⚠️ Подтверждён длительный сбой связи с NotebookLM. "
+                "Две проверки подряд не смогли получить доступ к базе. "
+                "Бот автоматически продолжает попытки восстановления."
+            ),
+        )
+        _nb_health_alert_active = True
+    except Exception:
+        logger.exception("Could not notify admin about NotebookLM outage")
 
 
 COACH_SYSTEM_PROMPT = """Ты — коуч и наставник, глубоко знающий метод Терапия Души психолога и тренера Евгения Валентиновича Теребенина.
@@ -231,6 +252,11 @@ def _coach_reformat(raw_answer: str, question: str, history: list[dict]) -> str:
 
 _nb_last_error = ""
 _nb_health_alert_active = False
+_nb_health_failure_count = 0
+_NB_HEALTH_FAILURE_THRESHOLD = max(
+    2,
+    int(os.getenv("NOTEBOOKLM_HEALTH_FAILURE_THRESHOLD", "2")),
+)
 
 
 def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
@@ -1092,14 +1118,14 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Быстрый облачный preflight: проверяет доступ к 299 источникам и прогревает кэш.
+    # Облачный preflight: единичный сетевой сбой остаётся только в логах.
     if app.job_queue:
         app.job_queue.run_repeating(
             _periodic_nb_refresh_job,
-            interval=3 * 60 * 60,
+            interval=30 * 60,
             first=10,
         )
-        print("NotebookLM cloud preflight scheduled (every 3h)", flush=True)
+        print("NotebookLM cloud preflight scheduled (every 30m)", flush=True)
 
     print("Бот запущен. Ожидаю сообщения...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

@@ -332,8 +332,14 @@ class HandlerSecurityTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(send_message=AsyncMock())
         context = SimpleNamespace(bot=bot)
         main._nb_health_alert_active = False
+        main._nb_health_failure_count = 0
 
         with patch.object(main, "_run_blocking", AsyncMock(return_value=False)):
+            await main._periodic_nb_refresh_job(context)
+            self.assertEqual(bot.send_message.await_count, 0)
+            self.assertFalse(main._nb_health_alert_active)
+            self.assertEqual(main._nb_health_failure_count, 1)
+
             await main._periodic_nb_refresh_job(context)
             await main._periodic_nb_refresh_job(context)
 
@@ -345,6 +351,7 @@ class HandlerSecurityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(bot.send_message.await_count, 2)
         self.assertFalse(main._nb_health_alert_active)
+        self.assertEqual(main._nb_health_failure_count, 0)
 
 
 if __name__ == "__main__":
