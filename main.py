@@ -144,9 +144,11 @@ def _strip_markdown(text: str) -> str:
 
 
 def _refresh_notebooklm_auth_sync() -> bool:
-    """Quick cloud preflight using the same connector as real questions."""
+    """Refresh the Google session, then run the real cloud preflight."""
     try:
-        return _get_notebook_connector().verify_sources(force=True)
+        connector = _get_notebook_connector()
+        connector.refresh_session()
+        return connector.verify_sources(force=True)
     except NotebookConnectorError as exc:
         logger.error("NotebookLM cloud preflight configuration error: %s", exc)
         return False

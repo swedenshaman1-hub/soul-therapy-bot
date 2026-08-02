@@ -72,6 +72,8 @@ class NotebookConnector:
     def _load_auth() -> dict:
         encoded = os.getenv("NOTEBOOKLM_AUTH_JSON_B64", "").strip()
         plain = os.getenv("NOTEBOOKLM_AUTH_JSON", "").strip()
+        candidates: list[dict] = []
+        env_auth_invalid = False
 
         try:
             if encoded:
@@ -79,17 +81,47 @@ class NotebookConnector:
             elif plain:
                 raw = plain
             else:
-                raise NotebookConnectorError(
-                    "Не задана облачная авторизация NotebookLM"
-                )
-            auth = json.loads(raw.lstrip("\ufeff"))
-        except NotebookConnectorError:
-            raise
-        except Exception as exc:
-            raise NotebookConnectorError(
-                "Повреждена облачная авторизация NotebookLM"
-            ) from exc
+                raw = ""
+            if raw:
+                env_auth = json.loads(raw.lstrip("\ufeff"))
+                if isinstance(env_auth, dict) and isinstance(
+                    env_auth.get("cookies"), dict
+                ):
+                    candidates.append(env_auth)
+                else:
+                    env_auth_invalid = True
+        except Exception:
+            env_auth_invalid = True
+            logger.warning(
+                "Railway NotebookLM auth is invalid; trying persistent auth"
+            )
 
+        data_dir = os.getenv("NOTEBOOKLM_MCP_DATA_DIR", "").strip()
+        if data_dir:
+            disk_path = Path(data_dir) / "auth.json"
+            if disk_path.exists():
+                try:
+                    disk_auth = json.loads(disk_path.read_text(encoding="utf-8"))
+                    if isinstance(disk_auth.get("cookies"), dict):
+                        candidates.append(disk_auth)
+                except Exception as exc:
+                    logger.warning("Ignored invalid persistent NotebookLM auth: %s", exc)
+
+        if not candidates:
+            if env_auth_invalid:
+                raise NotebookConnectorError(
+                    "Повреждена облачная авторизация NotebookLM"
+                )
+            raise NotebookConnectorError(
+                "Не задана облачная авторизация NotebookLM"
+            )
+
+        # Metadata refreshes can rotate short-lived Google cookies.  Prefer the
+        # newest persisted copy over the older Railway environment snapshot.
+        auth = max(
+            candidates,
+            key=lambda item: float(item.get("extracted_at", 0) or 0),
+        )
         cookies = auth.get("cookies")
         if not isinstance(cookies, dict) or not cookies:
             raise NotebookConnectorError(
@@ -181,6 +213,10 @@ class NotebookConnector:
         except Exception as exc:
             logger.warning("NotebookLM metadata refresh failed: %s", exc)
             return False
+
+    def refresh_session(self) -> bool:
+        """Keep the Google session active and persist rotated cookies."""
+        return self._refresh_frontend_metadata()
 
     def _run_once(
         self,

@@ -60,6 +60,33 @@ class NotebookConnectorTests(unittest.TestCase):
         with open(auth_path, encoding="utf-8") as source:
             self.assertEqual(json.load(source)["cookies"]["SID"], "sid")
 
+    def test_newer_persistent_auth_wins_over_environment_snapshot(self):
+        auth_path = os.path.join(self.temp_dir.name, "auth.json")
+        newer = {
+            **AUTH,
+            "cookies": {**AUTH["cookies"], "SID": "newer-sid"},
+            "extracted_at": 200,
+        }
+        with open(auth_path, "w", encoding="utf-8") as target:
+            json.dump(newer, target)
+
+        connector = NotebookConnector("notebook-id")
+
+        self.assertEqual(connector._auth["cookies"]["SID"], "newer-sid")
+
+    def test_persistent_auth_recovers_from_invalid_environment_snapshot(self):
+        auth_path = os.path.join(self.temp_dir.name, "auth.json")
+        with open(auth_path, "w", encoding="utf-8") as target:
+            json.dump({**AUTH, "extracted_at": 300}, target)
+
+        with patch.dict(
+            os.environ,
+            {"NOTEBOOKLM_AUTH_JSON_B64": "not-valid-base64"},
+        ):
+            connector = NotebookConnector("notebook-id")
+
+        self.assertEqual(connector._auth["cookies"]["SID"], "sid")
+
     def test_missing_auth_fails_closed(self):
         with patch.dict(
             os.environ,
