@@ -23,6 +23,7 @@ from functools import partial
 
 import access_control as access_db
 import edge_tts
+import learning_system as learning_db
 from notebook_connector import NotebookConnector, NotebookConnectorError
 
 from dotenv import load_dotenv
@@ -64,21 +65,42 @@ ADMIN_CHAT_IDS: set[int] = {ADMIN_ID}
 BOT_USERNAME = os.getenv("BOT_USERNAME", "TerapiyaDushi_AI_bot").lstrip("@")
 BOT_DISPLAY_NAME = "Терапия Души Ассистент"
 
-NOTEBOOK_ID = "88a124fc-a20d-4836-99a3-25b079468568"
+DEFAULT_NOTEBOOK_ID = "88a124fc-a20d-4836-99a3-25b079468568"
+
+
+def _configured_notebook_ids() -> tuple[str, ...]:
+    raw = os.getenv("NOTEBOOK_IDS", DEFAULT_NOTEBOOK_ID)
+    values = re.split(r"[,;\s]+", raw.strip())
+    unique = tuple(dict.fromkeys(value for value in values if value))
+    return unique or (DEFAULT_NOTEBOOK_ID,)
+
+
+NOTEBOOK_IDS = _configured_notebook_ids()
+NOTEBOOK_ID = NOTEBOOK_IDS[0]  # Backward-compatible primary ID.
 # На Windows используем uv-окружение, на Linux (Railway) — системный Python
 _WIN_MCP_PYTHON = r"C:\Users\Admin\AppData\Roaming\uv\tools\notebooklm-mcp-2026\Scripts\python.exe"
 MCP_PYTHON = _WIN_MCP_PYTHON if os.path.exists(_WIN_MCP_PYTHON) else sys.executable
-_notebook_connector: NotebookConnector | None = None
+_notebook_connectors: dict[str, NotebookConnector] = {}
 _notebook_connector_lock = threading.Lock()
 
 
-def _get_notebook_connector() -> NotebookConnector:
-    global _notebook_connector
-    if _notebook_connector is None:
+def _get_notebook_connector(notebook_id: str | None = None) -> NotebookConnector:
+    selected = notebook_id or NOTEBOOK_ID
+    connector = _notebook_connectors.get(selected)
+    if connector is None:
         with _notebook_connector_lock:
-            if _notebook_connector is None:
-                _notebook_connector = NotebookConnector(NOTEBOOK_ID)
-    return _notebook_connector
+            connector = _notebook_connectors.get(selected)
+            if connector is None:
+                connector = NotebookConnector(selected)
+                _notebook_connectors[selected] = connector
+    return connector
+
+
+def _all_notebook_connectors() -> list[tuple[str, NotebookConnector]]:
+    return [
+        (notebook_id, _get_notebook_connector(notebook_id))
+        for notebook_id in NOTEBOOK_IDS
+    ]
 
 # История диалога: chat_id -> список {"role": "user"|"assistant", "text": str}
 _history: dict[int, list[dict]] = defaultdict(list)
@@ -144,11 +166,22 @@ def _strip_markdown(text: str) -> str:
 
 
 def _refresh_notebooklm_auth_sync() -> bool:
-    """Refresh the Google session, then run the real cloud preflight."""
+    """Refresh every configured notebook, then run real cloud preflights."""
     try:
-        connector = _get_notebook_connector()
-        connector.refresh_session()
-        return connector.verify_sources(force=True)
+        results = []
+        for notebook_id, connector in _all_notebook_connectors():
+            connector.refresh_session()
+            ok = connector.verify_sources(force=True)
+            results.append(ok)
+            logger.info(
+                "NotebookLM notebook %s health=%s sources=%s",
+                notebook_id[:8],
+                ok,
+                connector.source_count,
+            )
+        # A partial outage must not disable the bot while at least one notebook
+        # remains available. Individual failures are still visible in logs.
+        return bool(results) and any(results)
     except NotebookConnectorError as exc:
         logger.error("NotebookLM cloud preflight configuration error: %s", exc)
         return False
@@ -261,15 +294,43 @@ _NB_HEALTH_FAILURE_THRESHOLD = max(
 )
 
 
-def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
-    """Запрашивает NotebookLM через изолированный облачный коннектор."""
+def _query_all_notebooks(
+    query: str,
+    chat_id: int = 0,
+) -> list[tuple[str, str, int]]:
+    """Query all notebooks in parallel and keep successful answers independent."""
     global _nb_last_error
-    logger.info("NotebookLM cloud query: %s", query[:80])
+    logger.info(
+        "NotebookLM cloud query across %s notebook(s): %s",
+        len(NOTEBOOK_IDS),
+        query[:80],
+    )
     try:
-        connector = _get_notebook_connector()
-        answer = connector.query(query, chat_id)
-        _nb_last_error = connector.last_error
-        return answer
+        connectors = _all_notebook_connectors()
+
+        def ask(item: tuple[str, NotebookConnector]):
+            notebook_id, connector = item
+            return notebook_id, connector.query(query, chat_id), connector.last_error
+
+        if len(connectors) == 1:
+            results = [ask(connectors[0])]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(connectors)
+            ) as pool:
+                results = list(pool.map(ask, connectors))
+
+        answers: list[tuple[str, str, int]] = []
+        errors = []
+        for notebook_id, answer, error in results:
+            if answer:
+                source_count = _get_notebook_connector(notebook_id).source_count
+                answers.append((notebook_id, answer, source_count))
+            elif error:
+                errors.append(f"{notebook_id[:8]}: {error}")
+
+        _nb_last_error = " | ".join(errors)
+        return answers
     except NotebookConnectorError as exc:
         _nb_last_error = str(exc)
         logger.error("NotebookLM cloud configuration error: %s", exc)
@@ -277,7 +338,19 @@ def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
     except Exception as exc:
         _nb_last_error = f"{type(exc).__name__}: {exc}"
         logger.exception("NotebookLM cloud exception")
+        return []
+
+
+def _ask_notebooklm(query: str, chat_id: int = 0) -> str | None:
+    """Return one combined evidence block while tolerating a partial outage."""
+    answers = _query_all_notebooks(query, chat_id)
+    if not answers:
         return None
+    blocks = [
+        f"Материалы из блока знаний {index} ({notebook_id[:8]}):\n{answer}"
+        for index, (notebook_id, answer, _source_count) in enumerate(answers, start=1)
+    ]
+    return "\n\n".join(blocks)
 
 
 # ─── Транскрипция голоса ──────────────────────────────────────────────────────
@@ -657,6 +730,529 @@ async def _answer(update: Update, question: str):
     if not sent:
         _tts_answers.pop(tts_token, None)
 
+
+# ─── Адаптивное обучение ────────────────────────────────────────────────────
+
+def _json_from_model_text(text: str) -> dict:
+    """Parse a JSON object even when NotebookLM wraps it in a code fence."""
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        value = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("NotebookLM did not return a JSON object")
+        value = json.loads(cleaned[start:end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("NotebookLM returned JSON of the wrong type")
+    return value
+
+
+def _lesson_segment_count(daily_minutes: int) -> int:
+    if daily_minutes <= 15:
+        return 1
+    if daily_minutes <= 30:
+        return 2
+    if daily_minutes <= 45:
+        return 3
+    return 4
+
+
+def _lesson_notebook_prompt(lesson: dict, profile: dict, segment_count: int) -> str:
+    level = learning_db.EXPERIENCE_LEVELS.get(profile.get("experience"), "Знаком с методом")
+    goal = learning_db.LEARNING_GOALS.get(profile.get("goal"), "Систематизировать знания")
+    return f"""Создай интерактивное учебное занятие исключительно по источникам этого блокнота.
+
+Метод: Терапия Души Евгения Валентиновича Теребенина.
+Тема: {lesson['title']}.
+Учебная цель: {lesson['objective']}.
+Уровень ученика: {level}.
+Цель ученика: {goal}.
+
+Нужно ровно {segment_count} последовательных смысловых блока. В каждом дай живое объяснение
+на 120–220 слов, один вопрос для активного воспроизведения, эталон правильного ответа,
+короткую подсказку и практический пример. Не используй сведения вне источников блокнота.
+Не используй markdown, звёздочки, нумерованные списки и ссылки.
+
+Верни только корректный JSON без пояснений до и после:
+{{
+  "title": "название занятия",
+  "intro": "короткое вступление",
+  "segments": [
+    {{
+      "explanation": "объяснение",
+      "question": "вопрос ученику",
+      "reference_answer": "смысловые элементы правильного ответа",
+      "hint": "подсказка",
+      "example": "практический пример"
+    }}
+  ],
+  "summary": "краткий итог занятия"
+}}
+"""
+
+
+def _merge_lesson_packages(
+    responses: list[tuple[str, str, int]],
+    lesson: dict,
+    segment_count: int,
+) -> dict:
+    parsed: list[tuple[str, int, dict]] = []
+    required = {"explanation", "question", "reference_answer", "hint", "example"}
+    for notebook_id, answer, source_count in responses:
+        try:
+            package = _json_from_model_text(answer)
+        except Exception as exc:
+            logger.warning("Notebook %s lesson JSON rejected: %s", notebook_id[:8], exc)
+            continue
+        valid = []
+        for segment in package.get("segments") or []:
+            if isinstance(segment, dict) and required.issubset(segment):
+                item = {key: _strip_markdown(str(segment[key])) for key in required}
+                item["notebook_id"] = notebook_id
+                valid.append(item)
+        if valid:
+            package["segments"] = valid
+            parsed.append((notebook_id, source_count, package))
+    if not parsed:
+        raise ValueError("Connected notebooks did not return a valid lesson")
+
+    # A notebook containing only a directory link should not displace a fully
+    # indexed knowledge base. Once two notebooks have real content, alternate
+    # their segments so both contribute to the lesson.
+    rich = [item for item in parsed if item[1] >= 5]
+    contributors = rich if rich else parsed
+    contributors.sort(key=lambda item: item[1], reverse=True)
+    segments: list[dict] = []
+    seen_questions: set[str] = set()
+    if len(contributors) == 1:
+        candidate_segments = contributors[0][2]["segments"]
+    else:
+        candidate_segments = []
+        max_parts = max(len(item[2]["segments"]) for item in contributors)
+        for index in range(max_parts):
+            for _notebook_id, _count, package in contributors:
+                if index < len(package["segments"]):
+                    candidate_segments.append(package["segments"][index])
+    for segment in candidate_segments:
+        signature = re.sub(r"\W+", "", segment["question"].casefold())[:120]
+        if signature in seen_questions:
+            continue
+        seen_questions.add(signature)
+        segments.append(segment)
+        if len(segments) >= segment_count:
+            break
+    if not segments:
+        raise ValueError("Lesson contains no usable segments")
+    primary = contributors[0][2]
+    return {
+        "title": _strip_markdown(str(primary.get("title") or lesson["title"])),
+        "intro": _strip_markdown(str(primary.get("intro") or "")),
+        "segments": segments,
+        "summary": _strip_markdown(str(primary.get("summary") or "Тема закреплена.")),
+    }
+
+
+def _create_lesson_package(
+    lesson: dict,
+    profile: dict,
+    segment_count: int,
+    user_id: int,
+) -> dict:
+    prompt = _lesson_notebook_prompt(lesson, profile, segment_count)
+    responses = _query_all_notebooks(prompt, -abs(user_id))
+    if not responses:
+        raise RuntimeError(_nb_last_error or "NotebookLM returned no lesson")
+    return _merge_lesson_packages(responses, lesson, segment_count)
+
+
+def _evaluate_learning_answer(segment: dict, user_answer: str, user_id: int) -> dict:
+    notebook_id = segment.get("notebook_id") or NOTEBOOK_ID
+    prompt = f"""Проверь понимание ученика, опираясь только на источники этого блокнота.
+
+Учебный вопрос: {segment['question']}
+Ориентир ответа, составленный ранее по этому блокноту: {segment['reference_answer']}
+Ответ ученика: {user_answer}
+
+Не оценивай красоту речи. Оцени понимание смысла.
+Верни только JSON без markdown:
+{{"score": 0, "passed": false, "feedback": "короткий живой разбор на 2–4 предложения"}}
+
+Оценка 0 означает ответ не по теме, 1 — понимание недостаточное, 2 — основная мысль усвоена,
+3 — точное и полное понимание. passed равен true только при оценке 2 или 3.
+"""
+    connector = _get_notebook_connector(notebook_id)
+    evaluation_chat = -(2_000_000_000 - (abs(user_id) % 1_000_000))
+    raw = connector.query(prompt, evaluation_chat)
+    if not raw:
+        raise RuntimeError(connector.last_error or "NotebookLM evaluation failed")
+    result = _json_from_model_text(raw)
+    score = max(0, min(3, int(result.get("score", 0))))
+    return {
+        "score": score,
+        "passed": bool(result.get("passed")) and score >= 2,
+        "feedback": _strip_markdown(str(result.get("feedback") or "")),
+    }
+
+
+def _experience_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"learn:exp:{key}")]
+        for key, label in learning_db.EXPERIENCE_LEVELS.items()
+    ])
+
+
+def _goal_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"learn:goal:{key}")]
+        for key, label in learning_db.LEARNING_GOALS.items()
+    ])
+
+
+def _time_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("15 минут", callback_data="learn:time:15"),
+            InlineKeyboardButton("30 минут", callback_data="learn:time:30"),
+        ],
+        [
+            InlineKeyboardButton("45 минут", callback_data="learn:time:45"),
+            InlineKeyboardButton("60 минут", callback_data="learn:time:60"),
+        ],
+    ])
+
+
+def _format_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"learn:format:{key}")]
+        for key, label in learning_db.DELIVERY_FORMATS.items()
+    ])
+
+
+def _learning_menu_keyboard(has_session: bool = False) -> InlineKeyboardMarkup:
+    first_label = "▶️ Продолжить занятие" if has_session else "▶️ Начать занятие"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(first_label, callback_data="learn:start")],
+        [
+            InlineKeyboardButton("🔁 Повторение", callback_data="learn:review"),
+            InlineKeyboardButton("🧠 Быстрый тест", callback_data="learn:quiz"),
+        ],
+        [InlineKeyboardButton("❓ Задать вопрос", callback_data="learn:free")],
+        [
+            InlineKeyboardButton("📊 Мой прогресс", callback_data="learn:progress"),
+            InlineKeyboardButton("⚙️ Настройки", callback_data="learn:settings"),
+        ],
+    ])
+
+
+def _remember_tts(user_id: int, text: str) -> str:
+    token = uuid.uuid4().hex[:16]
+    _tts_answers[token] = (user_id, text)
+    while len(_tts_answers) > _TTS_CACHE_LIMIT:
+        _tts_answers.pop(next(iter(_tts_answers)))
+    return token
+
+
+def _lesson_keyboard(user_id: int, spoken_text: str) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("💡 Подсказка", callback_data="learn:hint"),
+        InlineKeyboardButton("🧩 Пример", callback_data="learn:example"),
+    ]]
+    profile = learning_db.get_profile(user_id) or {}
+    if profile.get("delivery_format") in {"voice", "mixed"}:
+        token = _remember_tts(user_id, spoken_text)
+        rows.append([InlineKeyboardButton("🔊 Озвучить этот блок", callback_data=f"tts:{token}")])
+    rows.append([InlineKeyboardButton("⏸ Завершить позже", callback_data="learn:pause")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _reply_long(message, text: str, reply_markup=None) -> None:
+    chunks = [text[i:i + 4000] for i in range(0, len(text), 4000)] or [text]
+    for index, chunk in enumerate(chunks):
+        await message.reply_text(
+            chunk,
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+        )
+
+
+async def _send_onboarding_step(message, user_id: int) -> None:
+    profile = learning_db.ensure_profile(user_id)
+    step = profile.get("onboarding_step") or "experience"
+    if step == "experience":
+        await message.reply_text(
+            "Чтобы выстроить обучение именно под тебя, сначала уточню твой опыт. "
+            "Насколько ты знаком с методом Терапия Души?",
+            reply_markup=_experience_keyboard(),
+        )
+    elif step == "goal":
+        await message.reply_text(
+            "Какой результат обучения для тебя сейчас важнее всего?",
+            reply_markup=_goal_keyboard(),
+        )
+    elif step == "time":
+        await message.reply_text(
+            "Сколько времени ты готов уделять одному занятию в день?",
+            reply_markup=_time_keyboard(),
+        )
+    elif step == "format":
+        await message.reply_text(
+            "В каком формате тебе удобнее проходить занятия? "
+            "В голосовом и смешанном формате озвучка запускается отдельной кнопкой.",
+            reply_markup=_format_keyboard(),
+        )
+    else:
+        await _send_learning_home(message, user_id)
+
+
+async def _send_learning_home(message, user_id: int) -> None:
+    profile = learning_db.ensure_profile(user_id)
+    if not learning_db.profile_complete(profile):
+        await _send_onboarding_step(message, user_id)
+        return
+    progress = learning_db.progress_summary(user_id)
+    session = learning_db.get_session(user_id)
+    next_lesson = learning_db.get_next_lesson(user_id)
+    next_text = (
+        f"Следующая тема: {next_lesson['title']}."
+        if next_lesson
+        else "Основной маршрут пройден. Теперь можно повторять темы и укреплять мастерство."
+    )
+    await message.reply_text(
+        "Учебный кабинет Терапии Души\n\n"
+        f"Пройдено тем: {progress['completed']} из {progress['total']}.\n"
+        f"Средний уровень усвоения: {progress['average_mastery']} из 3.\n\n"
+        f"{next_text}",
+        reply_markup=_learning_menu_keyboard(bool(session)),
+    )
+
+
+async def _get_or_create_lesson_package(user_id: int, lesson: dict) -> dict:
+    profile = learning_db.get_profile(user_id) or learning_db.ensure_profile(user_id)
+    minutes = int(profile.get("daily_minutes") or 30)
+    count = _lesson_segment_count(minutes)
+    signature = "+".join(notebook_id[:8] for notebook_id in NOTEBOOK_IDS)
+    cache_key = learning_db.lesson_cache_key(
+        lesson["id"],
+        str(profile.get("experience") or "familiar"),
+        minutes,
+        signature,
+    )
+    cached = learning_db.get_cached_lesson(cache_key)
+    if cached:
+        return cached
+    package = await _run_blocking(
+        _create_lesson_package,
+        lesson,
+        profile,
+        count,
+        user_id,
+    )
+    learning_db.save_cached_lesson(cache_key, lesson["id"], package)
+    return package
+
+
+async def _send_lesson_segment(message, user_id: int, session: dict) -> None:
+    lesson = session.get("lesson") or {}
+    segments = lesson.get("segments") or []
+    index = int(session.get("segment_index") or 0)
+    if index >= len(segments):
+        mastery = learning_db.complete_lesson(user_id)
+        await message.reply_text(
+            f"Занятие завершено. Уровень усвоения: {mastery} из 3.",
+            reply_markup=_learning_menu_keyboard(False),
+        )
+        return
+    segment = segments[index]
+    title = lesson.get("title") or "Терапия Души"
+    text = (
+        f"{title}\n\n"
+        f"Часть {index + 1} из {len(segments)}\n\n"
+        f"{segment['explanation']}\n\n"
+        "Вопрос для закрепления\n\n"
+        f"{segment['question']}"
+    )
+    learning_db.update_session(user_id, state="awaiting_answer")
+    await _reply_long(message, text, _lesson_keyboard(user_id, text))
+
+
+async def _start_lesson(message, user_id: int, lesson: dict | None = None) -> None:
+    existing = learning_db.get_session(user_id)
+    if existing and lesson is None:
+        await _send_lesson_segment(message, user_id, existing)
+        return
+    selected = lesson or learning_db.get_next_lesson(user_id)
+    if not selected:
+        await message.reply_text(
+            "Ты уже прошёл основной маршрут. Выбери повторение или быстрый тест.",
+            reply_markup=_learning_menu_keyboard(False),
+        )
+        return
+    await message.reply_text(
+        f"Готовлю занятие «{selected['title']}» по материалам подключённых блокнотов. "
+        "Первое создание этой темы может занять около минуты. Затем она сохранится и будет открываться быстрее."
+    )
+    try:
+        package = await _get_or_create_lesson_package(user_id, selected)
+        session = learning_db.save_session(user_id, selected["id"], package)
+        if package.get("intro"):
+            await message.reply_text(package["intro"])
+        await _send_lesson_segment(message, user_id, session)
+    except Exception:
+        logger.exception("Could not build learning lesson")
+        await message.reply_text(
+            "Не удалось подготовить занятие из базы знаний. "
+            "Прогресс сохранён. Попробуй нажать кнопку ещё раз чуть позже.",
+            reply_markup=_learning_menu_keyboard(False),
+        )
+
+
+async def _handle_learning_answer(update: Update, answer_text: str) -> bool:
+    user_id = update.effective_user.id
+    session = learning_db.get_session(user_id)
+    if not session or session.get("state") != "awaiting_answer":
+        return False
+    segments = (session.get("lesson") or {}).get("segments") or []
+    index = int(session.get("segment_index") or 0)
+    if index >= len(segments):
+        return False
+    await update.message.reply_text("Проверяю понимание... 🧠")
+    try:
+        result = await _run_blocking(
+            _evaluate_learning_answer,
+            segments[index],
+            answer_text,
+            user_id,
+        )
+    except Exception:
+        logger.exception("Learning answer evaluation failed")
+        await update.message.reply_text(
+            "Сейчас не удалось проверить ответ. Занятие не потеряно — отправь ответ ещё раз."
+        )
+        return True
+    learning_db.record_score(user_id, result["score"])
+    if not result["passed"]:
+        await update.message.reply_text(
+            f"{result['feedback']}\n\nПопробуй сформулировать ответ ещё раз своими словами.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("💡 Подсказка", callback_data="learn:hint"),
+                InlineKeyboardButton("🧩 Пример", callback_data="learn:example"),
+            ]]),
+        )
+        return True
+    await update.message.reply_text(result["feedback"] or "Основная мысль усвоена.")
+    next_index = index + 1
+    if next_index < len(segments):
+        learning_db.update_session(user_id, segment_index=next_index, state="awaiting_answer")
+        await _send_lesson_segment(
+            update.message,
+            user_id,
+            learning_db.get_session(user_id) or session,
+        )
+    else:
+        summary = (session.get("lesson") or {}).get("summary") or "Тема закреплена."
+        mastery = learning_db.complete_lesson(user_id)
+        await update.message.reply_text(
+            f"Занятие завершено.\n\n{summary}\n\n"
+            f"Уровень усвоения: {mastery} из 3. Повторение будет предложено позже.",
+            reply_markup=_learning_menu_keyboard(False),
+        )
+    return True
+
+
+async def _route_user_input(update: Update, text: str) -> None:
+    if await _handle_learning_answer(update, text):
+        return
+    await _answer(update, text)
+
+
+async def handle_learning_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await query.answer("Доступ уже не активен", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+
+    if data.startswith("learn:exp:"):
+        value = data.rsplit(":", 1)[1]
+        if value in learning_db.EXPERIENCE_LEVELS:
+            learning_db.update_profile(user_id, experience=value, onboarding_step="goal")
+        await _send_onboarding_step(query.message, user_id)
+    elif data.startswith("learn:goal:"):
+        value = data.rsplit(":", 1)[1]
+        if value in learning_db.LEARNING_GOALS:
+            learning_db.update_profile(user_id, goal=value, onboarding_step="time")
+        await _send_onboarding_step(query.message, user_id)
+    elif data.startswith("learn:time:"):
+        value = int(data.rsplit(":", 1)[1])
+        if value in learning_db.DAILY_MINUTES:
+            learning_db.update_profile(user_id, daily_minutes=value, onboarding_step="format")
+        await _send_onboarding_step(query.message, user_id)
+    elif data.startswith("learn:format:"):
+        value = data.rsplit(":", 1)[1]
+        if value in learning_db.DELIVERY_FORMATS:
+            learning_db.update_profile(user_id, delivery_format=value, onboarding_step="complete")
+        await query.message.reply_text(
+            "Профиль обучения готов. Я буду вести тебя по темам последовательно."
+        )
+        await _send_learning_home(query.message, user_id)
+    elif data == "learn:start":
+        await _start_lesson(query.message, user_id)
+    elif data in {"learn:review", "learn:quiz"}:
+        record = (
+            learning_db.due_review(user_id)
+            if data == "learn:review"
+            else learning_db.latest_completed_lesson(user_id)
+        )
+        if not record or not record.get("lesson"):
+            await query.message.reply_text(
+                "Для повторения сначала нужно завершить хотя бы одно занятие.",
+                reply_markup=_learning_menu_keyboard(bool(learning_db.get_session(user_id))),
+            )
+        else:
+            await _start_lesson(query.message, user_id, record["lesson"])
+    elif data == "learn:progress":
+        progress = learning_db.progress_summary(user_id)
+        await query.message.reply_text(
+            f"Твой прогресс\n\nПройдено тем: {progress['completed']} из {progress['total']}.\n"
+            f"Средний уровень усвоения: {progress['average_mastery']} из 3.",
+            reply_markup=_learning_menu_keyboard(bool(learning_db.get_session(user_id))),
+        )
+    elif data == "learn:settings":
+        learning_db.restart_onboarding(user_id)
+        await _send_onboarding_step(query.message, user_id)
+    elif data == "learn:free":
+        if learning_db.get_session(user_id):
+            learning_db.pause_session(user_id)
+        await query.message.reply_text(
+            "Напиши или запиши голосом любой вопрос по методу Терапия Души. "
+            "Чтобы вернуться к занятию, нажми /start и выбери продолжение."
+        )
+    elif data in {"learn:hint", "learn:example"}:
+        session = learning_db.get_session(user_id)
+        if not session:
+            await query.message.reply_text("Активного занятия сейчас нет.")
+            return
+        segments = (session.get("lesson") or {}).get("segments") or []
+        index = int(session.get("segment_index") or 0)
+        if index >= len(segments):
+            return
+        field = "hint" if data == "learn:hint" else "example"
+        heading = "Подсказка" if field == "hint" else "Практический пример"
+        await query.message.reply_text(f"{heading}\n\n{segments[index][field]}")
+    elif data == "learn:pause":
+        learning_db.pause_session(user_id)
+        await query.message.reply_text(
+            "Занятие сохранено. Вернуться к нему можно через /start.",
+            reply_markup=_learning_menu_keyboard(True),
+        )
+    elif data == "learn:menu":
+        await _send_learning_home(query.message, user_id)
+
 # ─── Обработчики Telegram ────────────────────────────────────────────────────
 
 async def handle_application_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -742,6 +1338,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔗 Создать доступ на 7 дней", callback_data="admin:invite7")],
         [InlineKeyboardButton("👥 Активные пользователи", callback_data="admin:users")],
+        [InlineKeyboardButton("📚 Обновить учебный курс", callback_data="admin:course:refresh")],
         [InlineKeyboardButton("ℹ️ Инструкция", callback_data="admin:help")],
     ])
 
@@ -779,7 +1376,8 @@ async def _send_admin_panel(message, context: ContextTypes.DEFAULT_TYPE, pin: bo
     panel = await message.reply_text(
         "Панель администратора\n\n"
         "Здесь можно создать одноразовую ссылку на 7 дней, посмотреть "
-        "активных пользователей, продлить или отключить доступ.",
+        "активных пользователей, продлить или отключить доступ, а также "
+        "обновить учебные занятия после изменения материалов.",
         reply_markup=_admin_keyboard(),
     )
     if pin:
@@ -859,6 +1457,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             """Команды администратора:
 /admin — открыть и закрепить панель
+/learn — открыть учебный кабинет
 /invite7 — создать ссылку на 7 дней
 /users — активные пользователи
 /debug — диагностика
@@ -894,7 +1493,14 @@ async def handle_admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text(
             "Нажми «Создать доступ на 7 дней» и перешли полученную ссылку. "
             "После активации человек появится в списке пользователей. "
-            "Там же можно продлить или отключить его доступ."
+            "Там же можно продлить или отключить его доступ. "
+            "Кнопка обновления курса удаляет только кэш уроков: профили и прогресс сохраняются."
+        )
+    elif data == "admin:course:refresh":
+        cleared = learning_db.clear_lesson_cache()
+        await query.message.reply_text(
+            f"Кэш учебного курса очищен. Удалено занятий: {cleared}. "
+            "Следующие уроки будут заново собраны из подключённых блокнотов."
         )
     elif data.startswith("admin:extend:"):
         chat_id = int(data.rsplit(":", 1)[1])
@@ -947,15 +1553,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_access_denied(update.message)
         return
     await update.message.reply_text(
-        "Привет! Я коуч по методу Терапии Души Евгения Теребенина.\n\n"
-        "Задавай вопросы текстом или голосом — отвечу по авторским материалам метода.\n\n"
-        "С чего хочешь начать?\n"
-        "— Основы метода и его философия\n"
-        "— Что такое слайды и как с ними работать\n"
-        "— 7-шаговый алгоритм сессии\n"
-        "— Родовые программы и как их освобождать\n\n"
-        "/reset — начать диалог заново"
+        "Привет! Я коуч по методу Терапия Души Евгения Валентиновича Теребенина. "
+        "Я могу вести тебя по учебной программе и отвечать на отдельные вопросы текстом или голосом."
     )
+    await _send_learning_home(update.message, user_id)
+
+
+async def cmd_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not _is_allowed(user_id):
+        await _send_access_denied(update.message)
+        return
+    await _send_learning_home(update.message, user_id)
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -965,8 +1574,8 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_access_denied(update.message)
         return
     _history[chat_id].clear()
-    if _notebook_connector is not None:
-        _notebook_connector.reset_conversation(chat_id)
+    for connector in _notebook_connectors.values():
+        connector.reset_conversation(chat_id)
     await update.message.reply_text("Диалог сброшен. Начинаем с чистого листа. О чём поговорим?")
 
 
@@ -1018,11 +1627,15 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Что такое слайды?",
             ADMIN_ID,
         )
-        connector = _get_notebook_connector()
         lines.append(f"Статус: {'success' if answer else 'error'}")
-        lines.append(f"Источников обнаружено: {connector.source_count}")
-        if connector.last_error:
-            lines.append(f"Ошибка: {connector.last_error[-700:]}")
+        lines.append(f"Подключено блокнотов: {len(NOTEBOOK_IDS)}")
+        for notebook_id, connector in _all_notebook_connectors():
+            lines.append(
+                f"Блокнот {notebook_id[:8]}: источников {connector.source_count}, "
+                f"статус {'ok' if not connector.last_error else 'ошибка'}"
+            )
+            if connector.last_error:
+                lines.append(f"Ошибка {notebook_id[:8]}: {connector.last_error[-500:]}")
         if answer:
             lines.append(f"Ответ (первые 200 симв.):\n{answer[:200]}")
     except Exception as e:
@@ -1041,7 +1654,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     question = (update.message.text or "").strip()
     if not question:
         return
-    await _answer(update, question)
+    await _route_user_input(update, question)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1061,7 +1674,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _is_allowed(user_id):
             return
         await update.message.reply_text(question)
-        await _answer(update, question)
+        await _route_user_input(update, question)
     except TranscriptionError:
         logger.warning("Voice message was not reliably transcribed")
         if _is_allowed(user_id):
@@ -1095,8 +1708,11 @@ def main():
 
     print("Коуч Терапии Души запускается...")
     access_db.init_db()
+    learning_db.init_db()
     print(f"Администраторы: {ADMIN_CHAT_IDS}")
     print(f"База доступов: {access_db.DB_PATH}")
+    print(f"База обучения: {learning_db.DB_PATH}")
+    print(f"Подключённые NotebookLM: {NOTEBOOK_IDS}")
 
     app = (
         Application.builder()
@@ -1107,6 +1723,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("learn", cmd_learn))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("debug", cmd_debug))
@@ -1116,6 +1733,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_admin_button, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(handle_tts_button, pattern=r"^tts:"))
+    app.add_handler(CallbackQueryHandler(handle_learning_button, pattern=r"^learn:"))
     app.add_error_handler(handle_application_error)
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
